@@ -1,117 +1,184 @@
-#!/usr/bin/env python
-"""
-Town03 터널 경유 시나리오 (Phase 1).
-- 1대 차량 (hero)
-- basic agent 종/횡 제어
-- 목적지 도달 또는 충돌 → reset → 무한반복
+ #!/usr/bin/env python
+
 """
 
-import argparse
+CARLA 환경 래퍼.
+
+- Town03 로드
+
+- 단일 차량(hero) + 기본 센서 스폰
+
+- reset() 시 동일 spawn point로 재스폰
+
+"""
+
+
 import logging
-import math
 
 import carla
-from agents.navigation.basic_agent import BasicAgent
-
-from carla_env import CarlaEnv
 
 
-# ──────────────────────────────────────────────────────
-# 좌표 설정
-# Town03 spawn point 인덱스는 환경마다 다르니
-# find_spawn_points.py로 먼저 확인하고 여기에 박아.
-# 일단 디폴트값은 자리만 잡아둔 거임.
-# ──────────────────────────────────────────────────────
-SPAWN_INDEX = 0
-DESTINATION = carla.Location(x=0.0, y=0.0, z=0.0)  # 터널 반대편 좌표로 교체
 
-# 목적지 도달 판정 거리 (m)
-GOAL_RADIUS = 5.0
-# 에피소드 안전장치 (시뮬 시간 기준)
-MAX_EPISODE_TICKS = 4000  # 0.05s * 4000 = 200s
+class CarlaEnv:
+
+    def __init__(self, host="localhost", port=2000, town="Town03", dt=0.05):
+
+        self.client = carla.Client(host, port)
+
+        self.client.set_timeout(60.0)
 
 
-def distance(loc_a, loc_b):
-    return math.sqrt((loc_a.x - loc_b.x) ** 2 + (loc_a.y - loc_b.y) ** 2)
+        self.world = self.client.load_world(town)
+
+        self.map = self.world.get_map()
+
+        self.bp_lib = self.world.get_blueprint_library()
 
 
-def run_episode(env, agent, destination, ep_id):
-    ticks = 0
-    while True:
-        env.tick()
-        ticks += 1
+        self.original_settings = self.world.get_settings()
 
-        # 종료 조건
-        cur_loc = env.vehicle.get_transform().location
+        settings = self.world.get_settings()
 
-        if env.collision_flag:
-            logging.info("[Ep %d] Terminated: COLLISION (%d ticks)", ep_id, ticks)
-            return "collision"
+        settings.synchronous_mode = True
 
-        if distance(cur_loc, destination) < GOAL_RADIUS:
-            logging.info("[Ep %d] Terminated: GOAL REACHED (%d ticks)", ep_id, ticks)
-            return "goal"
+        settings.fixed_delta_seconds = dt
 
-        if agent.done():
-            logging.info("[Ep %d] Terminated: AGENT DONE (%d ticks)", ep_id, ticks)
-            return "agent_done"
-
-        if ticks >= MAX_EPISODE_TICKS:
-            logging.info("[Ep %d] Terminated: TIMEOUT (%d ticks)", ep_id, ticks)
-            return "timeout"
-
-        # 제어 입력
-        control = agent.run_step()
-        env.vehicle.apply_control(control)
+        self.world.apply_settings(settings)
 
 
-def main(args):
-    logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
+        self.tm = self.client.get_trafficmanager(8000)
 
-    env = CarlaEnv(host=args.host, port=args.port, town="Town03")
-
-    try:
-        spawn_points = env.map.get_spawn_points()
-        if args.spawn_index >= len(spawn_points):
-            raise IndexError(f"spawn_index {args.spawn_index} >= {len(spawn_points)}")
-        spawn_tf = spawn_points[args.spawn_index]
-
-        # destination이 디폴트(0,0,0)이면 spawn으로부터 +x 방향 임시 목표
-        dest = DESTINATION
-        if dest.x == 0.0 and dest.y == 0.0:
-            logging.warning(
-                "Destination is default (0,0,0); using a placeholder 100m ahead."
-            )
-            forward = spawn_tf.get_forward_vector()
-            dest = carla.Location(
-                x=spawn_tf.location.x + forward.x * 100,
-                y=spawn_tf.location.y + forward.y * 100,
-                z=spawn_tf.location.z,
-            )
-
-        env.spawn_vehicle(spawn_tf)
-
-        ep_id = 0
-        while True:
-            ep_id += 1
-            # basic agent는 에피소드마다 새로 만들어야 안전
-            agent = BasicAgent(env.vehicle, target_speed=args.target_speed)
-            agent.set_destination(dest)
-
-            result = run_episode(env, agent, dest, ep_id)
-            logging.info("[Ep %d] result=%s -> reset", ep_id, result)
-            env.reset()
-
-    except KeyboardInterrupt:
-        print("\nCancelled by user. Bye!")
-    finally:
-        env.destroy()
+        self.tm.set_synchronous_mode(True)
 
 
-if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--host", default="localhost")
-    p.add_argument("--port", default=2000, type=int)
-    p.add_argument("--spawn-index", default=SPAWN_INDEX, type=int)
-    p.add_argument("--target-speed", default=30.0, type=float, help="km/h")
-    main(p.parse_args())
+        self.vehicle = None
+
+        self.sensors = []
+
+        self.collision_flag = False
+
+        self.spawn_transform = None
+
+
+    def spawn_vehicle(self, spawn_transform, vehicle_filter="vehicle.lincoln.mkz_2017"):
+
+        self.spawn_transform = spawn_transform
+
+
+        bp = self.bp_lib.filter(vehicle_filter)[0]
+
+        bp.set_attribute("role_name", "hero")
+
+
+        self.vehicle = self.world.try_spawn_actor(bp, spawn_transform)
+
+        if self.vehicle is None:
+
+            raise RuntimeError("Vehicle spawn failed (blocked spawn point?)")
+
+
+        self._attach_sensors()
+
+        logging.info("Spawned vehicle id=%d at %s", self.vehicle.id, spawn_transform.location)
+
+        return self.vehicle
+
+
+    def _attach_sensors(self):
+
+        col_bp = self.bp_lib.find("sensor.other.collision")
+
+        col = self.world.spawn_actor(
+
+            col_bp, carla.Transform(), attach_to=self.vehicle
+
+        )
+
+        col.listen(lambda event: self._on_collision(event))
+
+        self.sensors.append(col)
+
+
+        cam_bp = self.bp_lib.find("sensor.camera.rgb")
+
+        cam_bp.set_attribute("image_size_x", "400")
+
+        cam_bp.set_attribute("image_size_y", "200")
+
+        cam_bp.set_attribute("fov", "90")
+
+
+        cam_tf = carla.Transform(
+
+            carla.Location(x=-4.5, z=2.5),
+
+            carla.Rotation(pitch=-20),
+
+        )
+
+
+        cam = self.world.spawn_actor(cam_bp, cam_tf, attach_to=self.vehicle)
+
+        self.sensors.append(cam)
+
+
+    def _on_collision(self, event):
+
+        self.collision_flag = True
+
+        logging.warning("Collision with %s", event.other_actor.type_id)
+
+
+    def tick(self):
+
+        self.world.tick()
+
+
+    def reset(self):
+
+        if self.vehicle is None or self.spawn_transform is None:
+
+            return
+
+
+        self.vehicle.set_transform(self.spawn_transform)
+
+        self.vehicle.set_target_velocity(carla.Vector3D())
+
+        self.vehicle.set_target_angular_velocity(carla.Vector3D())
+
+        self.vehicle.apply_control(carla.VehicleControl())
+
+        self.collision_flag = False
+
+
+        for _ in range(5):
+
+            self.world.tick()
+
+
+        logging.info("Reset vehicle to spawn point.")
+
+
+    def destroy(self):
+
+        for sensor in self.sensors:
+
+            if sensor.is_alive:
+
+                sensor.destroy()
+
+
+        self.sensors.clear()
+
+
+        if self.vehicle is not None and self.vehicle.is_alive:
+
+            self.vehicle.destroy()
+
+            self.vehicle = None
+
+
+        if self.world is not None and self.original_settings is not None:
+
+            self.world.apply_settings(self.original_settings) 
