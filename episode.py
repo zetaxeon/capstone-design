@@ -2,6 +2,7 @@
 
 import argparse
 import copy
+import csv
 import logging
 import math
 import os
@@ -20,7 +21,7 @@ from ros2_native import (
 )
 
 
-DEFAULT_SCENARIO_FILE = Path(__file__).with_name("scenario_town03.json")
+DEFAULT_SCENARIO_FILE = Path(__file__).parent / "configs" / "scenario_town03.json"
 
 
 def _load_basic_agent():
@@ -672,6 +673,36 @@ def _log_follower_metrics(episode_count, tick_count, metrics):
         metrics["brake"],
     )
 
+def _write_episode_csv(output_dir, episode_count, rows):
+    if not rows:
+        return
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    csv_path = output_dir / f"pid_episode_{episode_count:03d}.csv"
+
+    fieldnames = [
+        "episode",
+        "time_sec",
+        "tick",
+        "leader_phase",
+        "leader_speed_mps",
+        "follower_speed_mps",
+        "distance_m",
+        "desired_distance_m",
+        "spacing_error_m",
+        "relative_velocity_mps",
+        "throttle",
+        "brake",
+    ]
+
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    logging.info("Saved episode CSV: %s", csv_path)
 
 def _evaluate_episode(
     leader_vehicle,
@@ -843,6 +874,7 @@ def main(args):
                 _update_spectator(world, [leader_vehicle, follower_vehicle], spectator_config)
 
                 episode_count += 1
+                rows = []  # ← 이 줄 추가
                 logging.info(
                     "Episode %d started (leader target speed %.1f m/s)",
                     episode_count,
@@ -878,6 +910,21 @@ def main(args):
                         dt,
                     )
                     follower_vehicle.apply_control(follower_control)
+                    rows.append({
+                        "episode": episode_count,
+                        "time_sec": round(elapsed_sec, 3),
+                        "tick": tick_count,
+                        "leader_phase": leader_profile_state["phase"],
+                        "leader_speed_mps": round(follower_metrics["lead_speed_mps"], 3),
+                        "follower_speed_mps": round(follower_metrics["ego_speed_mps"], 3),
+                        "distance_m": round(follower_metrics["distance_m"], 3),
+                        "desired_distance_m": round(follower_metrics["desired_distance_m"], 3),
+                        "spacing_error_m": round(follower_metrics["spacing_error_m"], 3),
+                        "relative_velocity_mps": round(follower_metrics["relative_velocity_mps"], 3),
+                        "throttle": round(follower_metrics["throttle"], 3),
+                        "brake": round(follower_metrics["brake"], 3),
+                    })
+                   
                     if tick_count % follower_pid_state["log_interval_ticks"] == 0:
                         _log_follower_metrics(episode_count, tick_count, follower_metrics)
 
@@ -896,10 +943,12 @@ def main(args):
                     )
                     if reason is not None:
                         logging.info("Episode %d ended: %s", episode_count, reason)
+                        _write_episode_csv("outputs", episode_count, rows)  # ← 이 줄 추가
                         break
 
                     if elapsed_sec >= max_time_sec:
                         logging.info("Episode %d ended: timeout", episode_count)
+                        _write_episode_csv("outputs", episode_count, rows)  # ← 이 줄 추가
                         break
             except Exception as exc:
                 logging.exception("Episode %d failed: %s", episode_count + 1, exc)
