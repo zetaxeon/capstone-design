@@ -12,7 +12,7 @@
 
   "episode": {
     "mode": "infinite",
-    "max_time_sec": 120.0,
+    "max_time_sec": 45.0,
     "respawn_delay_sec": 0.25,
     "settle_time_sec": 1.5
   },
@@ -107,8 +107,8 @@
 
     "destination": {
       "location": {
-        "x": 230.00,
-        "y": 72.42,
+        "x": 230.89,
+        "y": 30.05,
         "z": 0.07
       }
     }

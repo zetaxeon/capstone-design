@@ -807,6 +807,13 @@ def main(args):
             float(args.max_connect_wait_sec),
             bool(scenario_config.get("allow_map_load", False)),
         )
+        
+        if args.no_rendering: 
+        	settings = world.get_settings()
+        	settings.no_rendering_mode = True 
+        	world.apply_settings(settings)
+        	logging.info("CARLA no-rendering mode enabled")
+        	
         map_ = world.get_map()
         _configure_traffic_lights(world, scenario_config)
 
@@ -1031,6 +1038,11 @@ if __name__ == "__main__":
         "--once",
         action="store_true",
         help="Run a single episode and exit",
+    )
+    argparser.add_argument(
+        "--no-rendering",
+        action="store_true",
+        help="Disable CARLA rendering for faster training",
     )
     argparser.add_argument(
         "-v",
