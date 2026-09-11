@@ -1,27 +1,36 @@
 {
   "_comment": [
-    "Town03_Opt two-vehicle scenario with rule-based follower CTG control.",
-    "Leader follows the existing waypoint route and speed profile.",
+    "Town03_Opt two-vehicle tunnel scenario with rule-based follower CTG control.",
+    "Leader starts before the tunnel, follows tunnel entrance/exit waypoints, and terminates after the tunnel.",
     "Follower uses BasicAgent for lateral path following only and direct PID longitudinal control.",
-    "All config time values are interpreted as real wall-clock seconds."
+    "Scenario timing is based on CARLA simulation time using fixed_delta_seconds."
   ],
+
   "map": "Town03_Opt",
   "allow_map_load": true,
   "stack_file": "stack.json",
+
   "episode": {
     "mode": "infinite",
     "max_time_sec": 120.0,
     "respawn_delay_sec": 0.25,
     "settle_time_sec": 1.5
   },
+
   "autopilot": false,
+
   "basic_agent": {
     "target_speed_kmh": 72.0,
     "follow_speed_limits": false,
     "ignore_traffic_lights": true
   },
+
   "speed_profile": {
-    "target_speeds_mps": [15.0, 17.5, 20.0],
+    "target_speeds_mps": [
+      15.0,
+      17.5,
+      20.0
+    ],
     "accel_mps2": 2.0,
     "decel_mps2": 3.5,
     "cruise_time_sec": 30.0,
@@ -29,6 +38,7 @@
     "stop_hold_sec": 1.0,
     "speed_tolerance_mps": 0.6
   },
+
   "follower_control": {
     "h": 1.0,
     "d0": 7.0,
@@ -45,9 +55,11 @@
     "stop_hold_sec": 1.0,
     "log_interval_ticks": 10
   },
+
   "traffic_lights": {
     "force_green": true
   },
+
   "termination": {
     "goal_tolerance_m": 5.0,
     "stuck_speed_mps": 0.5,
@@ -55,6 +67,7 @@
     "stuck_grace_sec": 12.0,
     "collision": true
   },
+
   "spectator": {
     "enabled": true,
     "distance": 12.0,
@@ -64,39 +77,43 @@
     "distance_scale": 0.8,
     "height_scale": 0.08
   },
+
   "leader": {
     "spawn_point": {
-      "x": 233.65,
-      "y": -82.98,
-      "z": 0.53,
-      "roll": 0.01,
-      "pitch": 0.00,
-      "yaw": 91.48
+      "x": 68.47,
+      "y": -195.78,
+      "z": 0.03,
+      "roll": 0.0,
+      "pitch": 0.0,
+      "yaw": 1.44
     },
+
     "route_points": [
       {
         "location": {
-          "x": 232.06,
-          "y": -18.32,
+          "x": 195.97,
+          "y": -197.20,
           "z": 0.03
         }
       },
       {
         "location": {
-          "x": 231.31,
-          "y": 12.57,
+          "x": 232.14,
+          "y": -21.30,
           "z": 0.03
         }
       }
     ],
+
     "destination": {
       "location": {
-        "x": 232.09,
-        "y": 89.55,
-        "z": 0.22
+        "x": 230.00,
+        "y": 72.42,
+        "z": 0.07
       }
     }
   },
+
   "follower": {
     "spawn_gap_m": 12.0
   }
