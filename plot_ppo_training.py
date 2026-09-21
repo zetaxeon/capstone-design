@@ -20,7 +20,7 @@ SERIES = "#2a78d6"
 REFERENCE = "#8a8984"
 
 EPISODE_PANELS = [
-    ("mean_reward", "Mean reward per tick", None),
+    ("episode_reward", "Episode reward (sum)", None),
     ("episode_cost", "Episode cumulative THW cost", "cost_limit"),
     ("mean_action", "Mean action (+ throttle / - brake)", 0.0),
     ("max_follower_speed_mps", "Max follower speed [m/s]", None),
