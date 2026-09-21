@@ -950,12 +950,12 @@ def main(args):
                     )
                     if reason is not None:
                         logging.info("Episode %d ended: %s", episode_count, reason)
-                        _write_episode_csv("outputs", episode_count, rows)  # ← 이 줄 추가
+                        _write_episode_csv("outputs/pid", episode_count, rows)  # ← 이 줄 추가
                         break
 
                     if elapsed_sec >= max_time_sec:
                         logging.info("Episode %d ended: timeout", episode_count)
-                        _write_episode_csv("outputs", episode_count, rows)  # ← 이 줄 추가
+                        _write_episode_csv("outputs/pid", episode_count, rows)  # ← 이 줄 추가
                         break
             except Exception as exc:
                 logging.exception("Episode %d failed: %s", episode_count + 1, exc)

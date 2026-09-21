@@ -20,7 +20,7 @@ try:
     from torch.distributions import Normal
 except ModuleNotFoundError as exc:
     raise SystemExit(
-        "PyTorch is required for episode_ppo.py. Install torch in the Python environment "
+        "PyTorch is required for episode_ppo_v2.py. Install torch in the Python environment "
         "used to run this script."
     ) from exc
 
@@ -602,6 +602,12 @@ def _advance_route_progress(vehicle, route_locations, next_route_index, goal_tol
     return next_route_index
 
 
+def _longitudinal_accel_mps2(vehicle):
+    accel = vehicle.get_acceleration()
+    forward = vehicle.get_transform().get_forward_vector()
+    return accel.x * forward.x + accel.y * forward.y + accel.z * forward.z
+
+
 def _compute_follower_control(leader_vehicle, follower_vehicle, follower_agent, follower_pid_state, dt):
     lead_speed_mps = _get_speed_mps(leader_vehicle)
     ego_speed_mps = _get_speed_mps(follower_vehicle)
@@ -611,13 +617,7 @@ def _compute_follower_control(leader_vehicle, follower_vehicle, follower_agent, 
     relative_velocity_mps = lead_speed_mps - ego_speed_mps
 
     # PPO observation: [gap, relative velocity, follower speed, leader longitudinal acceleration]
-    lead_accel = leader_vehicle.get_acceleration()
-    lead_forward = leader_vehicle.get_transform().get_forward_vector()
-    lead_accel_mps2 = (
-        lead_accel.x * lead_forward.x
-        + lead_accel.y * lead_forward.y
-        + lead_accel.z * lead_forward.z
-    )
+    lead_accel_mps2 = _longitudinal_accel_mps2(leader_vehicle)
     observation = [
         distance_m,
         relative_velocity_mps,
@@ -678,6 +678,7 @@ def _compute_follower_control(leader_vehicle, follower_vehicle, follower_agent, 
         "lead_speed_mps": lead_speed_mps,
         "ego_speed_mps": ego_speed_mps,
         "lead_accel_mps2": lead_accel_mps2,
+        "ego_accel_mps2": _longitudinal_accel_mps2(follower_vehicle),
         "observation": observation,
         "throttle": throttle,
         "brake": brake,
@@ -707,7 +708,7 @@ def _write_episode_csv(output_dir, episode_count, rows, controller="pid"):
     if not rows:
         return
 
-    output_dir = Path(output_dir)
+    output_dir = Path(output_dir) / controller
     output_dir.mkdir(parents=True, exist_ok=True)
 
     csv_path = output_dir / f"{controller}_episode_{episode_count:03d}.csv"
@@ -872,31 +873,41 @@ def _create_ppo_state(args, scenario_config):
         hidden_dim=int(ppo_config.get("hidden_dim", args.ppo_hidden_dim)),
     ).to(device)
 
+    lagrange_multiplier = max(0.0, float(ppo_config.get("initial_lambda", args.ppo_initial_lambda)))
+
     checkpoint_path = Path(args.ppo_checkpoint)
     if checkpoint_path.exists():
         payload = torch.load(checkpoint_path, map_location=device)
         state_dict = payload.get("model", payload)
         model.load_state_dict(state_dict)
-        logging.info("Loaded PPO checkpoint: %s", checkpoint_path)
+        if isinstance(payload, dict) and "lambda" in payload:
+            lagrange_multiplier = float(payload["lambda"])
+        logging.info("Loaded PPO checkpoint: %s (lambda=%.4f)", checkpoint_path, lagrange_multiplier)
 
     optimizer = optim.Adam(model.parameters(), lr=float(ppo_config.get("lr", args.ppo_lr)))
 
-    # lambda = softplus(log_lambda) >= 0
-    log_lambda = torch.tensor(
-        float(ppo_config.get("initial_log_lambda", -2.0)),
-        dtype=torch.float32,
-        device=device,
-        requires_grad=True,
-    )
-    lambda_optimizer = optim.Adam([log_lambda], lr=float(ppo_config.get("lambda_lr", args.ppo_lambda_lr)))
+    # Per-run metric logs start fresh, matching how episode CSVs are rewritten from 001 each run.
+    metrics_dir = Path(args.output_dir) / "ppo"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("ppo_episodes.csv", "ppo_updates.csv"):
+        (metrics_dir / name).unlink(missing_ok=True)
+
+    action_repeat = max(1, int(ppo_config.get("action_repeat", args.ppo_action_repeat)))
+    # gamma is given per simulator tick; convert so the discount horizon in seconds is unchanged.
+    gamma_per_tick = float(ppo_config.get("gamma", args.ppo_gamma))
 
     return {
         "device": device,
         "model": model,
         "optimizer": optimizer,
-        "log_lambda": log_lambda,
-        "lambda_optimizer": lambda_optimizer,
-        "gamma": float(ppo_config.get("gamma", args.ppo_gamma)),
+        "lambda": lagrange_multiplier,
+        "lambda_lr": float(ppo_config.get("lambda_lr", args.ppo_lambda_lr)),
+        "episode_costs": [],
+        "hard_violation_spacing_m": float(
+            ppo_config.get("hard_violation_spacing_m", args.ppo_hard_violation_spacing_m)
+        ),
+        "action_repeat": action_repeat,
+        "gamma": gamma_per_tick ** action_repeat,
         "gae_lambda": float(ppo_config.get("gae_lambda", args.ppo_gae_lambda)),
         "clip_ratio": float(ppo_config.get("clip_ratio", args.ppo_clip_ratio)),
         "entropy_coef": float(ppo_config.get("entropy_coef", args.ppo_entropy_coef)),
@@ -907,13 +918,11 @@ def _create_ppo_state(args, scenario_config):
         "minibatch_size": int(ppo_config.get("minibatch_size", args.ppo_minibatch_size)),
         "rollout_steps": int(ppo_config.get("rollout_steps", args.ppo_rollout_steps)),
         "checkpoint_path": checkpoint_path,
+        "episodes_csv": metrics_dir / "ppo_episodes.csv",
+        "updates_csv": metrics_dir / "ppo_updates.csv",
         "update_count": 0,
         "buffer": [],
     }
-
-
-def _ppo_lambda_value(ppo_state):
-    return torch.nn.functional.softplus(ppo_state["log_lambda"])
 
 
 def _ppo_policy_step(ppo_state, observation, deterministic=False):
@@ -961,59 +970,64 @@ def _ppo_longitudinal_control(action, base_control, distance_m, emergency_distan
     return control
 
 
-def _ppo_reward_and_cost(metrics, follower_pid_state):
-    """
-    Reward shaping for longitudinal following.
+# Reward and safety-cost parameters from the paper (Table I).
+REWARD_W_CONT = 0.1
+REWARD_W_TRAF = 0.25
+REWARD_W_JERK = 0.25
+REWARD_Q_SPACING = 2.0
+REWARD_Q_REL_SPEED = 1.0
+REWARD_D_FAR = 8.0
+REWARD_D_CLOSE = -4.0
+REWARD_ALPHA_FAR = 20.0
+REWARD_ALPHA_CLOSE = 10.0
+THW_SAFE_SEC = 1.2
+THW_DANGER_SEC = 1.0
 
-    - Reduce spacing error.
-    - Reduce relative-speed error.
-    - Encourage the follower to move when the leader is moving.
-    - Keep safety violations separate as PPO-Lagrangian cost.
+PPO_FAILURE_REASONS = ("hard_violation", "follower_collision", "leader_collision")
+
+
+def _spacing_penalty(spacing_error):
+    if spacing_error > REWARD_D_FAR:
+        return (spacing_error - REWARD_D_FAR) ** 2 / REWARD_ALPHA_FAR
+    if spacing_error < REWARD_D_CLOSE:
+        return (spacing_error - REWARD_D_CLOSE) ** 2 / REWARD_ALPHA_CLOSE
+    return 0.0
+
+
+def _thw_cost(thw):
+    if thw >= THW_SAFE_SEC:
+        return 0.0
+    if thw <= THW_DANGER_SEC:
+        return 1.0
+    return ((THW_SAFE_SEC - thw) / (THW_SAFE_SEC - THW_DANGER_SEC)) ** 2
+
+
+def _ppo_reward_and_cost(metrics, reward_state):
+    """Paper eq. (10)-(15): r = exp(-(w1 r_cont + w2 r_traf + w3 r_jerk)) - r_penalty, THW 3-level cost.
+
+    The a_i terms use the follower's measured longitudinal acceleration [m/s^2], matching how
+    plot_pid_metrics.py computes traffic disturbance and comfort for evaluation.
     """
     spacing_error = float(metrics["spacing_error_m"])
     rel_speed = float(metrics["relative_velocity_mps"])
     speed = float(metrics["ego_speed_mps"])
-    lead_speed = float(metrics["lead_speed_mps"])
     distance = float(metrics["distance_m"])
+    accel = float(metrics["ego_accel_mps2"])
 
-    # Normalized tracking errors.
-    spacing_error_norm = abs(spacing_error) / 10.0
-    rel_speed_norm = abs(rel_speed) / 10.0
+    prev_accel = reward_state["prev_accel_mps2"]
+    reward_state["prev_accel_mps2"] = accel
 
-    tracking_reward = (
-        1.0
-        - 0.6 * spacing_error_norm
-        - 0.3 * rel_speed_norm
-    )
+    r_cont = REWARD_Q_SPACING * spacing_error ** 2 + REWARD_Q_REL_SPEED * rel_speed ** 2
+    r_traf = accel ** 2
+    r_jerk = 0.0 if prev_accel is None else (accel - prev_accel) ** 2
+    penalty = _spacing_penalty(spacing_error)
 
-    # Encourage the follower to reach a similar speed once the leader is moving.
-    if lead_speed > 1.0:
-        speed_ratio = _clamp(speed / max(lead_speed, 1e-3), 0.0, 1.0)
-        motion_reward = 0.5 * speed_ratio
-    else:
-        motion_reward = 0.0
+    reward = math.exp(-(REWARD_W_CONT * r_cont + REWARD_W_TRAF * r_traf + REWARD_W_JERK * r_jerk)) - penalty
 
-    # Explicitly penalize staying nearly stopped while the leader is moving away.
-    launch_penalty = 0.0
-    if lead_speed > 2.0 and speed < 0.5:
-        launch_penalty = 0.5
+    thw = distance / speed if speed > 0.5 else float("inf")
+    cost = _thw_cost(thw)
 
-    reward = tracking_reward + motion_reward - launch_penalty
-
-    # Keep the critic target scale reasonable without making all bad states identical.
-    reward = _clamp(reward, -3.0, 2.0)
-
-    if speed > 0.5:
-        thw = distance / max(speed, 1e-3)
-    else:
-        thw = float("inf")
-
-    thw_limit = 1.0
-    emergency_distance = float(follower_pid_state["emergency_distance_m"])
-    unsafe = (thw < thw_limit) or (distance < emergency_distance)
-    cost = 1.0 if unsafe else 0.0
-
-    return reward, cost, thw
+    return reward, cost, thw, penalty
 
 def _append_ppo_transition(ppo_state, policy_step, reward, cost, done):
     transition = dict(policy_step)
@@ -1021,6 +1035,20 @@ def _append_ppo_transition(ppo_state, policy_step, reward, cost, done):
     transition["cost"] = float(cost)
     transition["done"] = bool(done)
     ppo_state["buffer"].append(transition)
+
+
+def _finish_ppo_episode(ppo_state, pending_step, reward_sum, cost_sum, window_ticks, terminal_reward=0.0):
+    if pending_step is not None and window_ticks > 0:
+        _append_ppo_transition(
+            ppo_state,
+            pending_step,
+            reward_sum / window_ticks + terminal_reward,
+            cost_sum / window_ticks,
+            True,
+        )
+    elif ppo_state["buffer"]:
+        ppo_state["buffer"][-1]["reward"] += terminal_reward
+        ppo_state["buffer"][-1]["done"] = True
 
 
 def _compute_gae(rewards, values, dones, gamma, gae_lambda, bootstrap_value):
@@ -1110,8 +1138,9 @@ def _ppo_update(ppo_state, bootstrap_observation=None):
             new_log_probs = _tanh_log_prob(distribution, raw_actions, batch_actions)
             ratio = torch.exp(new_log_probs - batch_old_log_probs)
 
-            lagrange_multiplier = _ppo_lambda_value(ppo_state).detach()
-            combined_adv = batch_reward_adv - lagrange_multiplier * batch_cost_adv
+            lagrange_multiplier = ppo_state["lambda"]
+            # Dividing by (1 + lambda) keeps the actor step size bounded as lambda grows (OmniSafe PPOLag).
+            combined_adv = (batch_reward_adv - lagrange_multiplier * batch_cost_adv) / (1.0 + lagrange_multiplier)
 
             surrogate_1 = ratio * combined_adv
             surrogate_2 = torch.clamp(
@@ -1142,19 +1171,19 @@ def _ppo_update(ppo_state, bootstrap_observation=None):
             cost_value_loss_value = float(cost_value_loss.item())
             entropy_value = float(entropy.item())
 
-    # Lagrange multiplier update: increase lambda when mean cost exceeds the limit.
-    mean_cost = torch.tensor(
-        sum(item["cost"] for item in buffer) / max(1, len(buffer)),
-        dtype=torch.float32,
-        device=device,
-    )
-    lambda_loss = -_ppo_lambda_value(ppo_state) * (mean_cost - ppo_state["cost_limit"])
-    ppo_state["lambda_optimizer"].zero_grad()
-    lambda_loss.backward()
-    ppo_state["lambda_optimizer"].step()
+    # Paper eq.: lambda <- [lambda + eta * (E[C_episode] - d)]+, using episodes completed since the last update.
+    episode_costs = ppo_state["episode_costs"]
+    mean_episode_cost = None
+    if episode_costs:
+        mean_episode_cost = sum(episode_costs) / len(episode_costs)
+        ppo_state["lambda"] = max(
+            0.0,
+            ppo_state["lambda"] + ppo_state["lambda_lr"] * (mean_episode_cost - ppo_state["cost_limit"]),
+        )
+        episode_costs.clear()
 
     ppo_state["update_count"] += 1
-    lagrange_value = float(_ppo_lambda_value(ppo_state).detach().item())
+    lagrange_value = ppo_state["lambda"]
 
     checkpoint_path = ppo_state["checkpoint_path"]
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1173,12 +1202,96 @@ def _ppo_update(ppo_state, bootstrap_observation=None):
         "reward_value_loss": reward_value_loss_value,
         "cost_value_loss": cost_value_loss_value,
         "entropy": entropy_value,
-        "mean_cost": float(mean_cost.item()),
+        "mean_reward": sum(item["reward"] for item in buffer) / sample_count,
+        "mean_cost": sum(item["cost"] for item in buffer) / sample_count,
+        "mean_episode_cost": mean_episode_cost,
         "lambda": lagrange_value,
         "update_count": ppo_state["update_count"],
     }
     ppo_state["buffer"].clear()
     return result
+
+
+PPO_UPDATE_FIELDS = [
+    "update",
+    "episode",
+    "samples",
+    "mean_reward",
+    "mean_cost",
+    "mean_episode_cost",
+    "lambda",
+    "entropy",
+    "actor_loss",
+    "reward_value_loss",
+    "cost_value_loss",
+]
+
+PPO_EPISODE_FIELDS = [
+    "episode",
+    "end_reason",
+    "sim_time_sec",
+    "updates_so_far",
+    "mean_reward",
+    "mean_cost",
+    "episode_cost",
+    "mean_action",
+    "max_follower_speed_mps",
+    "mean_follower_speed_mps",
+    "mean_abs_spacing_error_m",
+    "mean_abs_relative_velocity_mps",
+    "min_distance_m",
+]
+
+
+def _append_csv_row(csv_path, fieldnames, row):
+    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+    with csv_path.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def _record_ppo_update(ppo_state, result, episode_count):
+    if result is None:
+        return
+    row = {
+        "update": result["update_count"],
+        "episode": episode_count,
+        "samples": result["samples"],
+        "mean_reward": round(result["mean_reward"], 5),
+        "mean_cost": round(result["mean_cost"], 5),
+        "mean_episode_cost": "" if result["mean_episode_cost"] is None else round(result["mean_episode_cost"], 5),
+        "lambda": round(result["lambda"], 5),
+        "entropy": round(result["entropy"], 5),
+        "actor_loss": round(result["actor_loss"], 5),
+        "reward_value_loss": round(result["reward_value_loss"], 5),
+        "cost_value_loss": round(result["cost_value_loss"], 5),
+    }
+    _append_csv_row(ppo_state["updates_csv"], PPO_UPDATE_FIELDS, row)
+
+
+def _record_ppo_episode(ppo_state, episode_count, end_reason, elapsed_sec, rows, episode_stats):
+    if not rows or episode_stats["ticks"] == 0:
+        return
+    n = len(rows)
+    ticks = episode_stats["ticks"]
+    row = {
+        "episode": episode_count,
+        "end_reason": end_reason,
+        "sim_time_sec": round(elapsed_sec, 3),
+        "updates_so_far": ppo_state["update_count"],
+        "mean_reward": round(episode_stats["reward_sum"] / ticks, 5),
+        "mean_cost": round(episode_stats["cost_sum"] / ticks, 5),
+        "episode_cost": round(episode_stats["cost_sum"], 5),
+        "mean_action": round(episode_stats["action_sum"] / ticks, 5),
+        "max_follower_speed_mps": max(r["follower_speed_mps"] for r in rows),
+        "mean_follower_speed_mps": round(sum(r["follower_speed_mps"] for r in rows) / n, 5),
+        "mean_abs_spacing_error_m": round(sum(abs(r["spacing_error_m"]) for r in rows) / n, 5),
+        "mean_abs_relative_velocity_mps": round(sum(abs(r["relative_velocity_mps"]) for r in rows) / n, 5),
+        "min_distance_m": min(r["distance_m"] for r in rows),
+    }
+    _append_csv_row(ppo_state["episodes_csv"], PPO_EPISODE_FIELDS, row)
 
 
 def _log_ppo_update(result):
@@ -1187,7 +1300,7 @@ def _log_ppo_update(result):
     logging.info(
         (
             "PPO update %d: samples=%d actor_loss=%.4f reward_v_loss=%.4f "
-            "cost_v_loss=%.4f entropy=%.4f mean_cost=%.4f lambda=%.4f"
+            "cost_v_loss=%.4f entropy=%.4f mean_reward=%.4f mean_cost=%.4f episode_cost=%s lambda=%.4f"
         ),
         result["update_count"],
         result["samples"],
@@ -1195,7 +1308,9 @@ def _log_ppo_update(result):
         result["reward_value_loss"],
         result["cost_value_loss"],
         result["entropy"],
+        result["mean_reward"],
         result["mean_cost"],
+        "n/a" if result["mean_episode_cost"] is None else f"{result['mean_episode_cost']:.3f}",
         result["lambda"],
     )
 
@@ -1235,12 +1350,12 @@ def main(args):
             bool(scenario_config.get("allow_map_load", False)),
         )
         
-        if args.no_rendering: 
-        	settings = world.get_settings()
-        	settings.no_rendering_mode = True 
-        	world.apply_settings(settings)
-        	logging.info("CARLA no-rendering mode enabled")
-        	
+        if args.no_rendering:
+            settings = world.get_settings()
+            settings.no_rendering_mode = True
+            world.apply_settings(settings)
+            logging.info("CARLA no-rendering mode enabled")
+
         map_ = world.get_map()
         _configure_traffic_lights(world, scenario_config)
 
@@ -1259,9 +1374,12 @@ def main(args):
         if args.controller == "ppo":
             ppo_state = _create_ppo_state(args, scenario_config)
             logging.info(
-                "PPO-Lagrangian enabled on %s; checkpoint=%s",
+                "PPO-Lagrangian enabled on %s; checkpoint=%s action_repeat=%d gamma/decision=%.4f rollout=%d decisions",
                 ppo_state["device"],
                 ppo_state["checkpoint_path"],
+                ppo_state["action_repeat"],
+                ppo_state["gamma"],
+                ppo_state["rollout_steps"],
             )
 
         episode_count = 0
@@ -1327,6 +1445,15 @@ def main(args):
                 elapsed_sec = 0.0
                 tick_count = 0
                 pending_ppo_step = None
+                window_reward_sum = 0.0
+                window_cost_sum = 0.0
+                window_ticks = 0
+                episode_stats = {"reward_sum": 0.0, "cost_sum": 0.0, "action_sum": 0.0, "ticks": 0}
+                reward_state = {"prev_accel_mps2": None}
+                ppo_penalty = 0.0
+                # Guards GAE against chaining into an episode that aborted with an exception.
+                if ppo_state is not None and ppo_state["buffer"]:
+                    ppo_state["buffer"][-1]["done"] = True
                 route_state = {
                     "leader_index": 0,
                     "follower_index": 0,
@@ -1360,32 +1487,43 @@ def main(args):
 
                     if args.controller == "ppo":
                         # Current state is the outcome of the action chosen on the previous tick.
-                        ppo_reward, ppo_cost, ppo_thw = _ppo_reward_and_cost(
+                        ppo_reward, ppo_cost, ppo_thw, ppo_penalty = _ppo_reward_and_cost(
                             follower_metrics,
-                            follower_pid_state,
+                            reward_state,
                         )
 
                         if pending_ppo_step is not None:
-                            _append_ppo_transition(
-                                ppo_state,
-                                pending_ppo_step,
-                                ppo_reward,
-                                ppo_cost,
-                                False,
-                            )
+                            window_reward_sum += ppo_reward
+                            window_cost_sum += ppo_cost
+                            window_ticks += 1
 
-                        if len(ppo_state["buffer"]) >= ppo_state["rollout_steps"]:
-                            update_result = _ppo_update(
-                                ppo_state,
-                                bootstrap_observation=follower_metrics["observation"],
-                            )
-                            _log_ppo_update(update_result)
+                        # Hold each action for action_repeat ticks so throttle lasts long enough to launch.
+                        if pending_ppo_step is None or window_ticks >= ppo_state["action_repeat"]:
+                            if pending_ppo_step is not None:
+                                _append_ppo_transition(
+                                    ppo_state,
+                                    pending_ppo_step,
+                                    window_reward_sum / window_ticks,
+                                    window_cost_sum / window_ticks,
+                                    False,
+                                )
 
-                        pending_ppo_step = _ppo_policy_step(
-                            ppo_state,
-                            follower_metrics["observation"],
-                            deterministic=args.ppo_deterministic,
-                        )
+                            if len(ppo_state["buffer"]) >= ppo_state["rollout_steps"]:
+                                update_result = _ppo_update(
+                                    ppo_state,
+                                    bootstrap_observation=follower_metrics["observation"],
+                                )
+                                _log_ppo_update(update_result)
+                                _record_ppo_update(ppo_state, update_result, episode_count)
+
+                            pending_ppo_step = _ppo_policy_step(
+                                ppo_state,
+                                follower_metrics["observation"],
+                                deterministic=args.ppo_deterministic,
+                            )
+                            window_reward_sum = 0.0
+                            window_cost_sum = 0.0
+                            window_ticks = 0
                         follower_control = _ppo_longitudinal_control(
                             pending_ppo_step["action"],
                             follower_control,
@@ -1395,6 +1533,11 @@ def main(args):
 
                         follower_metrics["throttle"] = follower_control.throttle
                         follower_metrics["brake"] = follower_control.brake
+
+                        episode_stats["reward_sum"] += ppo_reward
+                        episode_stats["cost_sum"] += ppo_cost
+                        episode_stats["action_sum"] += pending_ppo_step["action"]
+                        episode_stats["ticks"] += 1
 
                         if tick_count % follower_pid_state["log_interval_ticks"] == 0:
                             logging.info(
@@ -1438,23 +1581,34 @@ def main(args):
                         termination,
                         dt,
                     )
+                    if (
+                        reason is None
+                        and args.controller == "ppo"
+                        and follower_metrics["spacing_error_m"] > ppo_state["hard_violation_spacing_m"]
+                    ):
+                        reason = "hard_violation"
+                    if reason is None and elapsed_sec >= max_time_sec:
+                        reason = "timeout"
+
                     if reason is not None:
                         logging.info("Episode %d ended: %s", episode_count, reason)
                         if args.controller == "ppo":
-                            if pending_ppo_step is not None and ppo_reward is not None:
-                                # The just-issued action has not produced another simulator tick yet,
-                                # so do not append it. Flush only realized transitions.
-                                pending_ppo_step = None
-                            _log_ppo_update(_ppo_update(ppo_state, bootstrap_observation=None))
-                        _write_episode_csv("outputs", episode_count, rows, controller=args.controller)
-                        break
-
-                    if elapsed_sec >= max_time_sec:
-                        logging.info("Episode %d ended: timeout", episode_count)
-                        if args.controller == "ppo":
-                            pending_ppo_step = None
-                            _log_ppo_update(_ppo_update(ppo_state, bootstrap_observation=None))
-                        _write_episode_csv("outputs", episode_count, rows, controller=args.controller)
+                            # Failure endings must not be an escape from ongoing penalty, so charge
+                            # the final penalty as if it persisted forever: penalty / (1 - gamma).
+                            terminal_reward = 0.0
+                            if reason in PPO_FAILURE_REASONS:
+                                terminal_reward = -ppo_penalty / (1.0 - ppo_state["gamma"])
+                            _finish_ppo_episode(
+                                ppo_state,
+                                pending_ppo_step,
+                                window_reward_sum,
+                                window_cost_sum,
+                                window_ticks,
+                                terminal_reward,
+                            )
+                            ppo_state["episode_costs"].append(episode_stats["cost_sum"])
+                            _record_ppo_episode(ppo_state, episode_count, reason, elapsed_sec, rows, episode_stats)
+                        _write_episode_csv(args.output_dir, episode_count, rows, controller=args.controller)
                         break
             except Exception as exc:
                 logging.exception("Episode %d failed: %s", episode_count + 1, exc)
@@ -1550,6 +1704,11 @@ if __name__ == "__main__":
         help="Longitudinal controller to use: pid or ppo (default: pid)",
     )
     argparser.add_argument(
+        "--output-dir",
+        default="outputs",
+        help="Root for episode CSVs and PPO metric logs; written under <dir>/<controller>/ (default: outputs)",
+    )
+    argparser.add_argument(
         "--ppo-checkpoint",
         default="outputs/ppo_lag.pt",
         help="PPO checkpoint path (default: outputs/ppo_lag.pt)",
@@ -1568,17 +1727,50 @@ if __name__ == "__main__":
     argparser.add_argument("--seed", type=int, default=42)
     argparser.add_argument("--ppo-hidden-dim", type=int, default=128)
     argparser.add_argument("--ppo-lr", type=float, default=3e-4)
-    argparser.add_argument("--ppo-lambda-lr", type=float, default=5e-3)
-    argparser.add_argument("--ppo-gamma", type=float, default=0.99)
+    argparser.add_argument(
+        "--ppo-lambda-lr",
+        type=float,
+        default=0.01,
+        help="Step size eta in lambda <- [lambda + eta*(E[episode cost] - d)]+ (default: 0.01)",
+    )
+    argparser.add_argument("--ppo-initial-lambda", type=float, default=0.0)
+    argparser.add_argument(
+        "--ppo-hard-violation-spacing-m",
+        type=float,
+        default=40.0,
+        help="End a PPO episode as a failure when spacing error exceeds this [m] (default: 40)",
+    )
+    argparser.add_argument(
+        "--ppo-action-repeat",
+        type=int,
+        default=10,
+        help="Simulator ticks to hold each PPO action (default: 10 = 0.5s at dt=0.05)",
+    )
+    argparser.add_argument(
+        "--ppo-gamma",
+        type=float,
+        default=0.99,
+        help="Discount per simulator tick; raised to the action-repeat power per decision (default: 0.99)",
+    )
     argparser.add_argument("--ppo-gae-lambda", type=float, default=0.95)
     argparser.add_argument("--ppo-clip-ratio", type=float, default=0.2)
     argparser.add_argument("--ppo-entropy-coef", type=float, default=0.01)
     argparser.add_argument("--ppo-value-coef", type=float, default=0.5)
     argparser.add_argument("--ppo-cost-value-coef", type=float, default=0.5)
-    argparser.add_argument("--ppo-cost-limit", type=float, default=0.02)
+    argparser.add_argument(
+        "--ppo-cost-limit",
+        type=float,
+        default=5.0,
+        help="Cumulative THW cost limit d per episode, in ticks (paper Table I, default: 5)",
+    )
     argparser.add_argument("--ppo-update-epochs", type=int, default=10)
     argparser.add_argument("--ppo-minibatch-size", type=int, default=64)
-    argparser.add_argument("--ppo-rollout-steps", type=int, default=1024)
+    argparser.add_argument(
+        "--ppo-rollout-steps",
+        type=int,
+        default=512,
+        help="PPO decisions (not ticks) collected across episodes before each update (default: 512)",
+    )
     argparser.add_argument(
         "-v",
         "--verbose",
