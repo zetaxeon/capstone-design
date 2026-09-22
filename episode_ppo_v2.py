@@ -842,25 +842,64 @@ def _normalize_ppo_observation(observation):
     return [float(value) / scale for value, scale in zip(observation, PPO_OBS_SCALES)]
 
 
+# The reward critic learns returns in normalized units (running mean/std of the GAE targets),
+# so its loss and gradients stay O(1) instead of ~1e5. Rewards, costs, and lambda are unchanged;
+# values are converted back to real units before GAE.
+def _create_return_stats():
+    return {"mean": 0.0, "var": 1.0, "count": 1e-4}
+
+
+def _update_return_stats(stats, values):
+    batch = torch.as_tensor(values, dtype=torch.float64)
+    batch_count = batch.numel()
+    batch_mean = float(batch.mean())
+    batch_var = float(batch.var(unbiased=False))
+    delta = batch_mean - stats["mean"]
+    total = stats["count"] + batch_count
+    stats["mean"] += delta * batch_count / total
+    m2 = stats["var"] * stats["count"] + batch_var * batch_count + delta ** 2 * stats["count"] * batch_count / total
+    stats["var"] = m2 / total
+    stats["count"] = total
+
+
+def _return_std(stats):
+    return math.sqrt(stats["var"] + 1e-8)
+
+
+def _denormalize_reward_value(stats, normalized_value):
+    return normalized_value * _return_std(stats) + stats["mean"]
+
+
+def _mlp(obs_dim, hidden_dim, out_dim):
+    return nn.Sequential(
+        nn.Linear(obs_dim, hidden_dim),
+        nn.Tanh(),
+        nn.Linear(hidden_dim, hidden_dim),
+        nn.Tanh(),
+        nn.Linear(hidden_dim, out_dim),
+    )
+
+
 class _PPOLagPolicy(nn.Module):
+    # Actor, reward critic, and cost critic are separate networks (OmniSafe-style) so the
+    # large critic gradients cannot starve the actor through a shared backbone.
     def __init__(self, obs_dim=4, hidden_dim=128):
         super().__init__()
-        self.backbone = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-        )
-        self.actor_mean = nn.Linear(hidden_dim, 1)
-        self.reward_value = nn.Linear(hidden_dim, 1)
-        self.cost_value = nn.Linear(hidden_dim, 1)
+        self.actor_mean = _mlp(obs_dim, hidden_dim, 1)
         self.log_std = nn.Parameter(torch.tensor([-0.5], dtype=torch.float32))
+        self.reward_critic = _mlp(obs_dim, hidden_dim, 1)
+        self.cost_critic = _mlp(obs_dim, hidden_dim, 1)
+
+    def actor_parameters(self):
+        return list(self.actor_mean.parameters()) + [self.log_std]
+
+    def critic_parameters(self):
+        return list(self.reward_critic.parameters()) + list(self.cost_critic.parameters())
 
     def forward(self, obs):
-        features = self.backbone(obs)
-        mean = self.actor_mean(features)
-        reward_value = self.reward_value(features).squeeze(-1)
-        cost_value = self.cost_value(features).squeeze(-1)
+        mean = self.actor_mean(obs)
+        reward_value = self.reward_critic(obs).squeeze(-1)
+        cost_value = self.cost_critic(obs).squeeze(-1)
         return mean, reward_value, cost_value
 
     def distribution(self, obs):
@@ -899,8 +938,11 @@ def _create_ppo_state(args, scenario_config):
     ).to(device)
 
     lagrange_multiplier = max(0.0, float(ppo_config.get("initial_lambda", args.ppo_initial_lambda)))
-    optimizer = optim.Adam(model.parameters(), lr=float(ppo_config.get("lr", args.ppo_lr)))
+    lr = float(ppo_config.get("lr", args.ppo_lr))
+    actor_optimizer = optim.Adam(model.actor_parameters(), lr=lr)
+    critic_optimizer = optim.Adam(model.critic_parameters(), lr=lr)
     update_count = 0
+    return_stats = _create_return_stats()
 
     checkpoint_path = Path(args.ppo_checkpoint)
     if args.ppo_eval and not checkpoint_path.exists():
@@ -910,12 +952,22 @@ def _create_ppo_state(args, scenario_config):
         logging.warning("--ppo-fresh: ignoring %s; it will be overwritten at the first PPO update.", checkpoint_path)
     elif checkpoint_path.exists():
         payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        model.load_state_dict(payload.get("model", payload))
+        try:
+            model.load_state_dict(payload.get("model", payload))
+        except RuntimeError as exc:
+            raise SystemExit(
+                f"{checkpoint_path} was saved with the old shared-backbone network and cannot be loaded "
+                "into the separate actor/critic networks. Rerun with --ppo-fresh or pick another "
+                "--ppo-checkpoint."
+            ) from exc
         if isinstance(payload, dict):
             lagrange_multiplier = float(payload.get("lambda", lagrange_multiplier))
             update_count = int(payload.get("update_count", 0))
-            if "optimizer" in payload:
-                optimizer.load_state_dict(payload["optimizer"])
+            return_stats = payload.get("return_stats", return_stats)
+            if "actor_optimizer" in payload:
+                actor_optimizer.load_state_dict(payload["actor_optimizer"])
+            if "critic_optimizer" in payload:
+                critic_optimizer.load_state_dict(payload["critic_optimizer"])
         logging.info(
             "Loaded PPO checkpoint: %s (update=%d lambda=%.4f)",
             checkpoint_path,
@@ -936,7 +988,8 @@ def _create_ppo_state(args, scenario_config):
     return {
         "device": device,
         "model": model,
-        "optimizer": optimizer,
+        "actor_optimizer": actor_optimizer,
+        "critic_optimizer": critic_optimizer,
         "lambda": lagrange_multiplier,
         "lambda_lr": float(ppo_config.get("lambda_lr", args.ppo_lambda_lr)),
         "episode_costs": [],
@@ -958,6 +1011,7 @@ def _create_ppo_state(args, scenario_config):
         "episodes_csv": metrics_dir / "ppo_episodes.csv",
         "updates_csv": metrics_dir / "ppo_updates.csv",
         "update_count": update_count,
+        "return_stats": return_stats,
         "training": not args.ppo_eval,
         "buffer": [],
     }
@@ -985,7 +1039,7 @@ def _ppo_policy_step(ppo_state, observation, deterministic=False):
         "obs": obs_norm,
         "action": float(action.squeeze(0).squeeze(-1).item()),
         "log_prob": float(log_prob.item()),
-        "reward_value": float(reward_value.item()),
+        "reward_value": _denormalize_reward_value(ppo_state["return_stats"], float(reward_value.item())),
         "cost_value": float(cost_value.item()),
     }
 
@@ -1105,7 +1159,7 @@ def _ppo_update(ppo_state, bootstrap_observation=None):
         obs_tensor = torch.tensor(obs_norm, dtype=torch.float32, device=device).unsqueeze(0)
         with torch.no_grad():
             _, reward_value, cost_value = model(obs_tensor)
-        bootstrap_reward_value = float(reward_value.item())
+        bootstrap_reward_value = _denormalize_reward_value(ppo_state["return_stats"], float(reward_value.item()))
         bootstrap_cost_value = float(cost_value.item())
 
     reward_advantages, reward_returns = _compute_gae(
@@ -1130,7 +1184,10 @@ def _ppo_update(ppo_state, bootstrap_observation=None):
     old_log_probs = torch.tensor([item["log_prob"] for item in buffer], dtype=torch.float32, device=device)
     reward_adv = torch.tensor(reward_advantages, dtype=torch.float32, device=device)
     cost_adv = torch.tensor(cost_advantages, dtype=torch.float32, device=device)
+    return_stats = ppo_state["return_stats"]
+    _update_return_stats(return_stats, reward_returns)
     reward_ret = torch.tensor(reward_returns, dtype=torch.float32, device=device)
+    reward_ret = (reward_ret - return_stats["mean"]) / _return_std(return_stats)
     cost_ret = torch.tensor(cost_returns, dtype=torch.float32, device=device)
 
     reward_adv = (reward_adv - reward_adv.mean()) / (reward_adv.std(unbiased=False) + 1e-8)
@@ -1140,6 +1197,8 @@ def _ppo_update(ppo_state, bootstrap_observation=None):
     minibatch_size = max(1, min(ppo_state["minibatch_size"], sample_count))
 
     actor_loss_value = 0.0
+    actor_grad_norm_value = 0.0
+    critic_grad_norm_value = 0.0
     reward_value_loss_value = 0.0
     cost_value_loss_value = 0.0
     entropy_value = 0.0
@@ -1177,22 +1236,28 @@ def _ppo_update(ppo_state, bootstrap_observation=None):
             cost_value_loss = torch.nn.functional.mse_loss(cost_values, batch_cost_ret)
             entropy = distribution.entropy().sum(dim=-1).mean()
 
-            loss = (
-                actor_loss
-                + ppo_state["value_coef"] * reward_value_loss
+            policy_loss = actor_loss - ppo_state["entropy_coef"] * entropy
+            critic_loss = (
+                ppo_state["value_coef"] * reward_value_loss
                 + ppo_state["cost_value_coef"] * cost_value_loss
-                - ppo_state["entropy_coef"] * entropy
             )
 
-            ppo_state["optimizer"].zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-            ppo_state["optimizer"].step()
+            # The actor and critic graphs are disjoint, so one backward fills each group's
+            # gradients independently; each group is then clipped and stepped on its own.
+            ppo_state["actor_optimizer"].zero_grad()
+            ppo_state["critic_optimizer"].zero_grad()
+            (policy_loss + critic_loss).backward()
+            actor_grad_norm = torch.nn.utils.clip_grad_norm_(model.actor_parameters(), 0.5)
+            critic_grad_norm = torch.nn.utils.clip_grad_norm_(model.critic_parameters(), 0.5)
+            ppo_state["actor_optimizer"].step()
+            ppo_state["critic_optimizer"].step()
 
             actor_loss_value = float(actor_loss.item())
             reward_value_loss_value = float(reward_value_loss.item())
             cost_value_loss_value = float(cost_value_loss.item())
             entropy_value = float(entropy.item())
+            actor_grad_norm_value = float(actor_grad_norm.item())
+            critic_grad_norm_value = float(critic_grad_norm.item())
 
     # Paper eq.: lambda <- [lambda + eta * (E[C_episode] - d)]+, using episodes completed since the last update.
     episode_costs = ppo_state["episode_costs"]
@@ -1213,9 +1278,11 @@ def _ppo_update(ppo_state, bootstrap_observation=None):
     torch.save(
         {
             "model": model.state_dict(),
-            "optimizer": ppo_state["optimizer"].state_dict(),
+            "actor_optimizer": ppo_state["actor_optimizer"].state_dict(),
+            "critic_optimizer": ppo_state["critic_optimizer"].state_dict(),
             "update_count": ppo_state["update_count"],
             "lambda": lagrange_value,
+            "return_stats": ppo_state["return_stats"],
         },
         checkpoint_path,
     )
@@ -1226,6 +1293,11 @@ def _ppo_update(ppo_state, bootstrap_observation=None):
         "reward_value_loss": reward_value_loss_value,
         "cost_value_loss": cost_value_loss_value,
         "entropy": entropy_value,
+        "log_std": float(model.log_std.item()),
+        "return_mean": return_stats["mean"],
+        "return_std": _return_std(return_stats),
+        "actor_grad_norm": actor_grad_norm_value,
+        "critic_grad_norm": critic_grad_norm_value,
         "mean_reward": sum(item["reward"] for item in buffer) / sample_count,
         "mean_cost": sum(item["cost"] for item in buffer) / sample_count,
         "mean_episode_cost": mean_episode_cost,
@@ -1248,6 +1320,11 @@ PPO_UPDATE_FIELDS = [
     "actor_loss",
     "reward_value_loss",
     "cost_value_loss",
+    "log_std",
+    "actor_grad_norm",
+    "critic_grad_norm",
+    "return_mean",
+    "return_std",
 ]
 
 PPO_EPISODE_FIELDS = [
@@ -1298,6 +1375,11 @@ def _record_ppo_update(ppo_state, result, episode_count):
         "actor_loss": round(result["actor_loss"], 5),
         "reward_value_loss": round(result["reward_value_loss"], 5),
         "cost_value_loss": round(result["cost_value_loss"], 5),
+        "log_std": round(result["log_std"], 5),
+        "actor_grad_norm": round(result["actor_grad_norm"], 5),
+        "critic_grad_norm": round(result["critic_grad_norm"], 5),
+        "return_mean": round(result["return_mean"], 5),
+        "return_std": round(result["return_std"], 5),
     }
     _append_csv_row(ppo_state["updates_csv"], PPO_UPDATE_FIELDS, row)
 
@@ -1342,7 +1424,9 @@ def _log_ppo_update(result):
     logging.info(
         (
             "PPO update %d: samples=%d actor_loss=%.4f reward_v_loss=%.4f "
-            "cost_v_loss=%.4f entropy=%.4f mean_reward=%.4f mean_cost=%.4f episode_cost=%s lambda=%.4f"
+            "cost_v_loss=%.4f entropy=%.4f log_std=%.4f actor_grad=%.4f critic_grad=%.3f "
+            "return_mean=%.2f return_std=%.2f "
+            "mean_reward=%.4f mean_cost=%.4f episode_cost=%s lambda=%.4f"
         ),
         result["update_count"],
         result["samples"],
@@ -1350,6 +1434,11 @@ def _log_ppo_update(result):
         result["reward_value_loss"],
         result["cost_value_loss"],
         result["entropy"],
+        result["log_std"],
+        result["actor_grad_norm"],
+        result["critic_grad_norm"],
+        result["return_mean"],
+        result["return_std"],
         result["mean_reward"],
         result["mean_cost"],
         "n/a" if result["mean_episode_cost"] is None else f"{result['mean_episode_cost']:.3f}",
