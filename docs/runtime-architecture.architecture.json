@@ -1,0 +1,451 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "CARLA PPO-Lag Follower 런타임 아키텍처",
+    "output": "runtime-architecture.html",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1370,
+      860
+    ],
+    "repository": {
+      "url": "https://github.com/zetaxeon/capstone-design",
+      "provider": "github",
+      "revision": "d8311e1a250d2216dd588680bfc4cc3f8fade771"
+    }
+  },
+  "components": [
+    {
+      "id": "carla",
+      "type": "cloud",
+      "label": "CARLA Server",
+      "sublabel": "Town03_Opt · RPC :2000",
+      "tag": "sync · dt 0.05s",
+      "sources": [
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 1370,
+          "label": "carla.Client"
+        }
+      ],
+      "pos": [
+        30,
+        380
+      ],
+      "size": [
+        180,
+        104
+      ]
+    },
+    {
+      "id": "setup",
+      "type": "backend",
+      "label": "_setup_world",
+      "sublabel": "sync mode · TM :8000",
+      "pos": [
+        290,
+        80
+      ],
+      "size": [
+        180,
+        64
+      ],
+      "sources": [
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 246
+        }
+      ]
+    },
+    {
+      "id": "configs",
+      "type": "database",
+      "label": "configs/*.json",
+      "sublabel": "scenario_town03 + stack",
+      "pos": [
+        590,
+        80
+      ],
+      "size": [
+        180,
+        64
+      ],
+      "sources": [
+        {
+          "path": "configs/scenario_town03.json"
+        },
+        {
+          "path": "configs/stack.json"
+        }
+      ]
+    },
+    {
+      "id": "spawn",
+      "type": "backend",
+      "label": "spawn_actors_from_config",
+      "sublabel": "ros2_native.py",
+      "pos": [
+        290,
+        240
+      ],
+      "size": [
+        180,
+        64
+      ],
+      "sources": [
+        {
+          "path": "ros2_native.py",
+          "line": 253
+        }
+      ]
+    },
+    {
+      "id": "align",
+      "type": "backend",
+      "label": "_align_scenario_to_map",
+      "sublabel": "spawn + route per actor",
+      "pos": [
+        590,
+        240
+      ],
+      "size": [
+        180,
+        64
+      ],
+      "sources": [
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 198
+        }
+      ]
+    },
+    {
+      "id": "leader",
+      "type": "backend",
+      "label": "Leader BasicAgent",
+      "sublabel": "speed profile 15–20 m/s",
+      "pos": [
+        290,
+        400
+      ],
+      "size": [
+        180,
+        64
+      ],
+      "sources": [
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 548,
+          "label": "_build_basic_agent"
+        },
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 501,
+          "label": "_update_speed_profile"
+        }
+      ]
+    },
+    {
+      "id": "follower",
+      "type": "backend",
+      "label": "_compute_follower_control",
+      "sublabel": "follower BasicAgent steer + obs",
+      "pos": [
+        290,
+        580
+      ],
+      "size": [
+        180,
+        64
+      ],
+      "sources": [
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 611
+        }
+      ]
+    },
+    {
+      "id": "control",
+      "type": "backend",
+      "label": "_ppo_longitudinal_control",
+      "sublabel": "throttle / brake",
+      "pos": [
+        290,
+        740
+      ],
+      "size": [
+        180,
+        64
+      ],
+      "sources": [
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 993
+        }
+      ]
+    },
+    {
+      "id": "policy",
+      "type": "backend",
+      "label": "_ppo_policy_step",
+      "sublabel": "_PPOLagPolicy · tanh-Normal",
+      "pos": [
+        590,
+        740
+      ],
+      "size": [
+        180,
+        64
+      ],
+      "sources": [
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 970
+        },
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 845,
+          "label": "_PPOLagPolicy"
+        }
+      ]
+    },
+    {
+      "id": "reward",
+      "type": "backend",
+      "label": "_ppo_reward_and_cost",
+      "sublabel": "reward + THW cost",
+      "pos": [
+        880,
+        580
+      ],
+      "size": [
+        180,
+        64
+      ],
+      "sources": [
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 1032
+        }
+      ]
+    },
+    {
+      "id": "update",
+      "type": "backend",
+      "label": "_ppo_update",
+      "sublabel": "GAE · clip · λ update",
+      "pos": [
+        880,
+        740
+      ],
+      "size": [
+        180,
+        64
+      ],
+      "sources": [
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 1093
+        }
+      ]
+    },
+    {
+      "id": "ckpt",
+      "type": "database",
+      "label": "outputs/ppo_lag.pt",
+      "sublabel": "+ ppo_updates/episodes.csv",
+      "pos": [
+        1140,
+        740
+      ],
+      "size": [
+        180,
+        64
+      ],
+      "sources": [
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 1213,
+          "label": "torch.save"
+        }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Python client · episode_ppo_v2.py",
+      "wraps": [
+        "setup",
+        "configs",
+        "spawn",
+        "align",
+        "leader",
+        "follower",
+        "control",
+        "policy",
+        "reward",
+        "update",
+        "ckpt"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "cfg-setup",
+      "from": "configs",
+      "to": "setup",
+      "label": "map"
+    },
+    {
+      "id": "setup-carla",
+      "from": "setup",
+      "to": "carla",
+      "label": "apply_settings",
+      "variant": "emphasis",
+      "fromSide": "left",
+      "toSide": "top"
+    },
+    {
+      "id": "cfg-align",
+      "from": "configs",
+      "to": "align",
+      "label": "spawn/route",
+      "labelAt": [
+        680,
+        158
+      ]
+    },
+    {
+      "id": "align-spawn",
+      "from": "align",
+      "to": "spawn",
+      "label": "spawn_point"
+    },
+    {
+      "id": "spawn-carla",
+      "from": "spawn",
+      "to": "carla",
+      "label": "spawn_actor ×2",
+      "fromSide": "left",
+      "toSide": "top",
+      "labelSegment": 0
+    },
+    {
+      "id": "align-leader",
+      "from": "align",
+      "to": "leader",
+      "label": "leader route",
+      "fromSide": "bottom",
+      "toSide": "right"
+    },
+    {
+      "id": "align-follower",
+      "from": "align",
+      "to": "follower",
+      "label": "follower route",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "leader-carla",
+      "from": "leader",
+      "to": "carla",
+      "label": "apply_control"
+    },
+    {
+      "id": "carla-follower",
+      "from": "carla",
+      "to": "follower",
+      "label": "tick state",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "left"
+    },
+    {
+      "id": "follower-policy",
+      "from": "follower",
+      "to": "policy",
+      "label": "obs [Δd,Δv,a,v]",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "top"
+    },
+    {
+      "id": "policy-control",
+      "from": "policy",
+      "to": "control",
+      "label": "action ×10 ticks",
+      "variant": "emphasis"
+    },
+    {
+      "id": "control-carla",
+      "from": "control",
+      "to": "carla",
+      "label": "apply_control",
+      "variant": "emphasis",
+      "fromSide": "left",
+      "toSide": "bottom"
+    },
+    {
+      "id": "follower-reward",
+      "from": "follower",
+      "to": "reward",
+      "label": "metrics"
+    },
+    {
+      "id": "reward-update",
+      "from": "reward",
+      "to": "update",
+      "label": "r, c",
+      "labelAt": [
+        970,
+        658
+      ]
+    },
+    {
+      "id": "policy-update",
+      "from": "policy",
+      "to": "update",
+      "label": "logπ, V"
+    },
+    {
+      "id": "update-ckpt",
+      "from": "update",
+      "to": "ckpt",
+      "label": "torch.save",
+      "variant": "dashed"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "타이밍",
+      "items": [
+        "CARLA 틱: fixed_delta_seconds = 0.05s (동기 모드, 단일 tick 소유자)",
+        "PPO 결정: action_repeat = 10틱마다 1회 (0.5s), 그 사이 action 유지",
+        "업데이트: 버퍼 ≥ rollout_steps(512 결정) 시 틱 루프 안에서 _ppo_update"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Leader / Follower 분리",
+      "items": [
+        "Leader: scenario spawn_point + route_points/destination, BasicAgent가 조향·속도 모두 제어",
+        "Follower: spawn_gap_m=12 (leader 뒤로 투영), route 미지정 시 leader route 복사",
+        "Follower는 BasicAgent 조향 + PPO 종방향(throttle/brake)"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "PPO-Lagrangian",
+      "items": [
+        "reward: exp(-(ω·r)) - spacing penalty, cost: THW 3단계",
+        "λ ← [λ + η(E[C_ep] - d)]+ 를 업데이트마다 갱신",
+        "shared backbone: actor + reward V + cost V 단일 Adam"
+      ]
+    }
+  ]
+}
