@@ -887,10 +887,14 @@ PPO_TRUNCATION_REASONS = ("timeout", "leader_stuck")
 # cost, so both sides of the Lagrangian finally speak the same unit.
 #
 # d and eta are rescaled by the nominal episode length so that a nominal-length episode
-# reproduces the paper's lambda step exactly:
+# reproduces the previous per-episode lambda step exactly:
 #   eta_tick * (S/N - d_tick) == eta * (S - d)   when N == PPO_NOMINAL_EPISODE_TICKS
 PPO_PAPER_COST_LIMIT = 5.0          # [PAPER] Table I, as a per-episode tick sum
-PPO_PAPER_LAMBDA_LR = 0.01          # [PAPER] eta, paired with the per-episode d
+# The paper gives the lambda update only as a form, Algorithm 1 line 19:
+#   lambda <- [lambda + eta * (E[C] - d)]+
+# eta itself appears in neither Table I nor the text, and line 1 constrains the initial
+# multiplier only as lambda >= 0. Both values below are ours, not the paper's.
+PPO_PAPER_LAMBDA_LR = 0.01          # [ASSUMED] eta; carried over from the first implementation
 PPO_NOMINAL_EPISODE_TICKS = 650     # [ASSUMED] measured: 50 completed episodes ran 645 ticks
                                     # on average, median 652, at dt = 0.05 s
 PPO_COST_LIMIT_PER_TICK = PPO_PAPER_COST_LIMIT / PPO_NOMINAL_EPISODE_TICKS
@@ -2011,11 +2015,17 @@ if __name__ == "__main__":
         default=PPO_LAMBDA_LR_PER_TICK,
         help=(
             "Step size eta in lambda <- [lambda + eta*(E[per-tick cost] - d)]+. "
-            f"Paper eta={PPO_PAPER_LAMBDA_LR:g} paired with a per-episode d, rescaled here by the "
-            f"nominal {PPO_NOMINAL_EPISODE_TICKS}-tick episode (default: {PPO_LAMBDA_LR_PER_TICK:g})"
+            "The paper gives this equation but never a value for eta; "
+            f"eta={PPO_PAPER_LAMBDA_LR:g} is ours, rescaled by the nominal "
+            f"{PPO_NOMINAL_EPISODE_TICKS}-tick episode (default: {PPO_LAMBDA_LR_PER_TICK:g})"
         ),
     )
-    argparser.add_argument("--ppo-initial-lambda", type=float, default=0.0)
+    argparser.add_argument(
+        "--ppo-initial-lambda",
+        type=float,
+        default=0.0,
+        help="Initial Lagrange multiplier. The paper only requires lambda >= 0 (default: 0.0)",
+    )
     argparser.add_argument(
         "--ppo-hard-violation-spacing-m",
         type=float,
