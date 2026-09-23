@@ -735,9 +735,25 @@ def _write_episode_csv(output_dir, episode_count, rows, controller="pid"):
 
     logging.info("Saved episode CSV: %s", csv_path)
 
+
+def _leader_route_finished(leader_agent, route_state):
+    """True once the leader has nothing left to drive to.
+
+    BasicAgent.done() is the same condition that makes the local planner park the car, so it is
+    what we trust first; the route index is a fallback for agents that do not expose done().
+    """
+    if leader_agent is not None and hasattr(leader_agent, "done"):
+        if leader_agent.done():
+            return True
+
+    route_locations = route_state["leader_route_locations"]
+    return bool(route_locations) and route_state["leader_index"] >= len(route_locations)
+
+
 def _evaluate_episode(
     leader_vehicle,
     follower_vehicle,
+    leader_agent,
     leader_profile_state,
     follower_pid_state,
     route_state,
@@ -779,6 +795,20 @@ def _evaluate_episode(
     stuck_speed = float(termination.get("stuck_speed_mps", 0.5))
     stuck_time = float(termination.get("stuck_time_sec", 8.0))
     stuck_grace = float(termination.get("stuck_grace_sec", 0.0))
+
+    # The leader reaches its destination and parks while the speed profile is often still in
+    # "cruise", so the profile never completes on its own and the stuck timer used to end the
+    # episode as "leader_stuck". Arriving is the end of the route, not a stall: finish the profile
+    # and let the normal profile_completed ending wait for the follower to stop as well. This is
+    # checked before the grace window, because arriving early is still arriving.
+    if speed_mps < stuck_speed and _leader_route_finished(leader_agent, route_state):
+        if not leader_profile_state["profile_completed"]:
+            leader_profile_state["phase"] = "stopped"
+            leader_profile_state["commanded_speed_mps"] = 0.0
+            leader_profile_state["profile_completed"] = True
+        timers["stuck_sec"] = 0.0
+        return None
+
     if timers["elapsed_sec"] < stuck_grace:
         return None
 
@@ -836,6 +866,17 @@ PPO_OBS_SCALES = (20.0, 10.0, 5.0, 30.0)
 
 # [ASSUMED] Episode endings counted as follower failure; they receive a terminal penalty.
 PPO_FAILURE_REASONS = ("hard_violation", "follower_collision", "leader_collision")
+# A crash is the worst safety outcome, but it also ends the episode, so the cost critic would
+# otherwise learn that the collision state costs one tick while sustained tailgating costs
+# 1/(1-gamma). Charge the saturated THW cost as if it persisted, mirroring the reward penalty.
+# hard_violation is deliberately excluded: falling far behind is unsafe for tracking, not for THW.
+PPO_COLLISION_REASONS = ("follower_collision", "leader_collision")
+PPO_MAX_TICK_COST = 1.0       # _thw_cost saturates at 1.0 per tick
+# These endings cut the episode on a clock or on the leader, not because the follower finished
+# its job, so the future is not worth zero. Fold gamma * V(s_final) into the last transition
+# instead of letting done=True regress the critic toward 0. profile_completed stays terminal:
+# there the leader has parked and the follower has stopped, so there is genuinely nothing left.
+PPO_TRUNCATION_REASONS = ("timeout", "leader_stuck")
 
 
 def _normalize_ppo_observation(observation):
@@ -1106,6 +1147,19 @@ def _ppo_reward_and_cost(metrics, reward_state):
 
     return reward, cost, thw, penalty
 
+
+def _ppo_value_estimate(ppo_state, observation):
+    """V_r (in real reward units) and V_c for one observation, without sampling an action."""
+    obs_norm = _normalize_ppo_observation(observation)
+    obs_tensor = torch.tensor(obs_norm, dtype=torch.float32, device=ppo_state["device"]).unsqueeze(0)
+    with torch.no_grad():
+        _, reward_value, cost_value = ppo_state["model"](obs_tensor)
+    return (
+        _denormalize_reward_value(ppo_state["return_stats"], float(reward_value.item())),
+        float(cost_value.item()),
+    )
+
+
 def _append_ppo_transition(ppo_state, policy_step, reward, cost, done):
     transition = dict(policy_step)
     transition["reward"] = float(reward)
@@ -1114,17 +1168,26 @@ def _append_ppo_transition(ppo_state, policy_step, reward, cost, done):
     ppo_state["buffer"].append(transition)
 
 
-def _finish_ppo_episode(ppo_state, pending_step, reward_sum, cost_sum, window_ticks, terminal_reward=0.0):
+def _finish_ppo_episode(
+    ppo_state,
+    pending_step,
+    reward_sum,
+    cost_sum,
+    window_ticks,
+    terminal_reward=0.0,
+    terminal_cost=0.0,
+):
     if pending_step is not None and window_ticks > 0:
         _append_ppo_transition(
             ppo_state,
             pending_step,
             reward_sum / window_ticks + terminal_reward,
-            cost_sum / window_ticks,
+            cost_sum / window_ticks + terminal_cost,
             True,
         )
     elif ppo_state["buffer"]:
         ppo_state["buffer"][-1]["reward"] += terminal_reward
+        ppo_state["buffer"][-1]["cost"] += terminal_cost
         ppo_state["buffer"][-1]["done"] = True
 
 
@@ -1155,12 +1218,9 @@ def _ppo_update(ppo_state, bootstrap_observation=None):
     bootstrap_reward_value = 0.0
     bootstrap_cost_value = 0.0
     if bootstrap_observation is not None and not buffer[-1]["done"]:
-        obs_norm = _normalize_ppo_observation(bootstrap_observation)
-        obs_tensor = torch.tensor(obs_norm, dtype=torch.float32, device=device).unsqueeze(0)
-        with torch.no_grad():
-            _, reward_value, cost_value = model(obs_tensor)
-        bootstrap_reward_value = _denormalize_reward_value(ppo_state["return_stats"], float(reward_value.item()))
-        bootstrap_cost_value = float(cost_value.item())
+        bootstrap_reward_value, bootstrap_cost_value = _ppo_value_estimate(
+            ppo_state, bootstrap_observation
+        )
 
     reward_advantages, reward_returns = _compute_gae(
         [item["reward"] for item in buffer],
@@ -1360,6 +1420,23 @@ def _append_csv_row(csv_path, fieldnames, row):
         writer.writerow(row)
 
 
+def _flush_ppo_training(ppo_state, episode_count):
+    """Run one last update on whatever is still buffered when training stops.
+
+    _ppo_update is also what applies the lambda step and writes the checkpoint, so without this
+    the final partial rollout, its episode costs, and up to one update of progress are dropped
+    every time a run ends or is interrupted.
+    """
+    if ppo_state is None or not ppo_state["training"] or not ppo_state["buffer"]:
+        return
+
+    logging.info("Flushing %d buffered decisions before exit.", len(ppo_state["buffer"]))
+    result = _ppo_update(ppo_state)
+    if result is not None:
+        _log_ppo_update(result)
+        _record_ppo_update(ppo_state, result, episode_count)
+
+
 def _record_ppo_update(ppo_state, result, episode_count):
     if result is None:
         return
@@ -1462,6 +1539,8 @@ def main(args):
     world = None
     original_settings = None
     traffic_manager = None
+    ppo_state = None
+    episode_count = 0
 
     try:
         logging.info(
@@ -1501,7 +1580,6 @@ def main(args):
         tick_guard = _create_tick_guard(world)
         spectator_config = scenario_config.get("spectator", {})
 
-        ppo_state = None
         if args.controller == "ppo":
             ppo_state = _create_ppo_state(args, scenario_config)
             logging.info(
@@ -1513,7 +1591,6 @@ def main(args):
                 ppo_state["rollout_steps"],
             )
 
-        episode_count = 0
         while True:
             vehicles = []
             sensors = []
@@ -1714,6 +1791,7 @@ def main(args):
                     reason = _evaluate_episode(
                         leader_vehicle,
                         follower_vehicle,
+                        leader_agent,
                         leader_profile_state,
                         follower_pid_state,
                         route_state,
@@ -1740,8 +1818,17 @@ def main(args):
                                 # Failure endings must not be an escape from ongoing penalty, so charge
                                 # the final penalty as if it persisted forever: penalty / (1 - gamma).
                                 terminal_reward = 0.0
+                                terminal_cost = 0.0
                                 if reason in PPO_FAILURE_REASONS:
                                     terminal_reward = -ppo_penalty / (1.0 - ppo_state["gamma"])
+                                if reason in PPO_COLLISION_REASONS:
+                                    terminal_cost = PPO_MAX_TICK_COST / (1.0 - ppo_state["gamma"])
+                                if reason in PPO_TRUNCATION_REASONS:
+                                    boot_r, boot_c = _ppo_value_estimate(
+                                        ppo_state, follower_metrics["observation"]
+                                    )
+                                    terminal_reward = ppo_state["gamma"] * boot_r
+                                    terminal_cost = ppo_state["gamma"] * boot_c
                                 _finish_ppo_episode(
                                     ppo_state,
                                     pending_ppo_step,
@@ -1749,6 +1836,7 @@ def main(args):
                                     window_cost_sum,
                                     window_ticks,
                                     terminal_reward,
+                                    terminal_cost,
                                 )
                                 ppo_state["episode_costs"].append(episode_stats["cost_sum"])
                             _record_ppo_episode(
@@ -1767,8 +1855,11 @@ def main(args):
 
             _tick_for_seconds_single_owner(world, respawn_delay_sec, tick_guard)
 
+        _flush_ppo_training(ppo_state, episode_count)
+
     except KeyboardInterrupt:
         print("\nCancelled by user. Bye!")
+        _flush_ppo_training(ppo_state, episode_count)
     except RuntimeError as exc:
         message = str(exc)
         if "time-out" in message and "simulator" in message:
