@@ -1,0 +1,243 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "PPO-Lagrangian 추종 제어 학습 파이프라인",
+    "quality_profile": "standard",
+    "viewBox": [
+      1080,
+      700
+    ],
+    "legend": {
+      "entries": {
+        "security": {
+          "label": "safety / cost"
+        }
+      }
+    }
+  },
+  "stages": [
+    {
+      "label": "환경"
+    },
+    {
+      "label": "정책 · 가치"
+    },
+    {
+      "label": "롤아웃"
+    },
+    {
+      "label": "이득 · λ"
+    },
+    {
+      "label": "갱신"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "carla",
+      "type": "external",
+      "label": "CARLA Env",
+      "sublabel": "Town03_Opt · dt 0.05s",
+      "stage": 0,
+      "row": 1,
+      "tag": "sync tick",
+      "width": 150
+    },
+    {
+      "id": "actor",
+      "type": "backend",
+      "label": "Actor MLP",
+      "sublabel": "4-128-128-1 tanh",
+      "stage": 1,
+      "row": 0,
+      "tag": "own Adam + clip",
+      "width": 150
+    },
+    {
+      "id": "critics",
+      "type": "backend",
+      "label": "Critics (R + C)",
+      "sublabel": "separate MLPs",
+      "stage": 1,
+      "row": 2,
+      "tag": "own Adam + clip",
+      "width": 150
+    },
+    {
+      "id": "buffer",
+      "type": "messagebus",
+      "label": "Rollout Buffer",
+      "sublabel": "512 steps · repeat 10",
+      "stage": 2,
+      "row": 1,
+      "tag": "obs a logp r c V",
+      "width": 150
+    },
+    {
+      "id": "gae",
+      "type": "backend",
+      "label": "GAE",
+      "sublabel": "gamma 0.99^10 · 0.95",
+      "stage": 3,
+      "row": 1,
+      "tag": "A_r and A_c",
+      "width": 150
+    },
+    {
+      "id": "retstats",
+      "type": "database",
+      "label": "return_stats",
+      "sublabel": "running mean / std",
+      "stage": 3,
+      "row": 2,
+      "tag": "in checkpoint",
+      "width": 150
+    },
+    {
+      "id": "lamupd",
+      "type": "security",
+      "label": "Lagrange λ",
+      "sublabel": "max(0, λ + 0.01(J_c-5))",
+      "stage": 3,
+      "row": 3,
+      "tag": "per episode",
+      "width": 164
+    },
+    {
+      "id": "update",
+      "type": "backend",
+      "label": "PPO Update",
+      "sublabel": "clip 0.2 · 10 epochs",
+      "stage": 4,
+      "row": 0,
+      "tag": "split optimizers",
+      "width": 150
+    }
+  ],
+  "flows": [
+    {
+      "id": "obs-pi",
+      "from": "carla",
+      "to": "actor",
+      "label": "obs to pi",
+      "variant": "emphasis",
+      "labelDx": -42
+    },
+    {
+      "id": "obs-v",
+      "from": "carla",
+      "to": "critics",
+      "label": "obs to V"
+    },
+    {
+      "id": "act",
+      "from": "actor",
+      "to": "carla",
+      "label": "throttle / brake",
+      "variant": "emphasis",
+      "labelDy": -70
+    },
+    {
+      "id": "store-a",
+      "from": "actor",
+      "to": "buffer",
+      "label": "a, log pi",
+      "variant": "emphasis"
+    },
+    {
+      "id": "store-v",
+      "from": "critics",
+      "to": "buffer",
+      "label": "V_r, V_c"
+    },
+    {
+      "id": "batch",
+      "from": "buffer",
+      "to": "gae",
+      "label": "512 steps",
+      "variant": "emphasis"
+    },
+    {
+      "id": "ep-cost",
+      "from": "carla",
+      "to": "lamupd",
+      "label": "episode cost",
+      "variant": "security",
+      "route": "bottom-channel"
+    },
+    {
+      "id": "stats",
+      "from": "gae",
+      "to": "retstats",
+      "label": "return stats",
+      "labelDy": 24
+    },
+    {
+      "id": "adv",
+      "from": "gae",
+      "to": "update",
+      "label": "A_r, A_c",
+      "variant": "emphasis",
+      "labelDx": -42
+    },
+    {
+      "id": "scale",
+      "from": "retstats",
+      "to": "update",
+      "label": "mu, sigma"
+    },
+    {
+      "id": "lam",
+      "from": "lamupd",
+      "to": "update",
+      "label": "lambda",
+      "variant": "dashed"
+    },
+    {
+      "id": "upd-actor",
+      "from": "update",
+      "to": "actor",
+      "label": "theta update",
+      "variant": "dashed",
+      "route": "top-channel"
+    },
+    {
+      "id": "upd-critics",
+      "from": "update",
+      "to": "critics",
+      "label": "phi update",
+      "variant": "dashed",
+      "labelDy": 30
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "주 경로",
+      "items": [
+        "CARLA tick → 관측 → Actor 행동 → 다시 CARLA에 적용되는 제어 루프입니다",
+        "행동 하나를 10 tick(0.5 s) 유지하고, 그 구간의 보상·비용 평균을 전이 하나로 기록합니다",
+        "버퍼에 512개 결정이 쌓이면 에피소드 도중이라도 업데이트가 실행됩니다"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "이번에 고친 두 가지",
+      "items": [
+        "Actor와 두 Critic이 완전히 분리된 MLP이고, 옵티마이저와 grad clip도 각각 따로입니다",
+        "예전에는 backbone 하나에 clip 0.5를 한 번만 걸어 크리틱 그래디언트가 액터를 굶겼습니다",
+        "Reward Critic은 return_stats로 정규화된 단위에서 학습하고, 값은 GAE 전에 역정규화됩니다"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "안전 제약 경로",
+      "items": [
+        "THW가 1.2 s 아래로 내려가면 비용이 붙고, 1.0 s 이하는 비용 1입니다",
+        "λ는 에피소드 누적 비용의 평균이 한계 d = 5를 넘을 때만 올라갑니다",
+        "이득을 (1 + λ)로 나눠 λ가 커져도 액터 보폭이 발산하지 않게 잡아 둡니다"
+      ]
+    }
+  ]
+}
