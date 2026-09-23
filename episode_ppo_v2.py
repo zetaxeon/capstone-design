@@ -878,6 +878,24 @@ PPO_MAX_TICK_COST = 1.0       # _thw_cost saturates at 1.0 per tick
 # there the leader has parked and the follower has stopped, so there is genuinely nothing left.
 PPO_TRUNCATION_REASONS = ("timeout", "leader_stuck")
 
+# The lambda constraint is measured per tick, not per episode.
+#
+# The paper states d = 5 as a cumulative per-episode THW cost. Taken literally that makes the
+# constraint depend on how long an episode happens to last: in the 588-episode run, episodes ran
+# 68 to 762 ticks, an 11.2x spread, so ending early was itself a way to lower J_c. Dividing the
+# episode cost by its tick count removes that, and the cost critic already learns per-tick mean
+# cost, so both sides of the Lagrangian finally speak the same unit.
+#
+# d and eta are rescaled by the nominal episode length so that a nominal-length episode
+# reproduces the paper's lambda step exactly:
+#   eta_tick * (S/N - d_tick) == eta * (S - d)   when N == PPO_NOMINAL_EPISODE_TICKS
+PPO_PAPER_COST_LIMIT = 5.0          # [PAPER] Table I, as a per-episode tick sum
+PPO_PAPER_LAMBDA_LR = 0.01          # [PAPER] eta, paired with the per-episode d
+PPO_NOMINAL_EPISODE_TICKS = 650     # [ASSUMED] measured: 50 completed episodes ran 645 ticks
+                                    # on average, median 652, at dt = 0.05 s
+PPO_COST_LIMIT_PER_TICK = PPO_PAPER_COST_LIMIT / PPO_NOMINAL_EPISODE_TICKS
+PPO_LAMBDA_LR_PER_TICK = PPO_PAPER_LAMBDA_LR * PPO_NOMINAL_EPISODE_TICKS
+
 
 def _normalize_ppo_observation(observation):
     return [float(value) / scale for value, scale in zip(observation, PPO_OBS_SCALES)]
@@ -1319,7 +1337,9 @@ def _ppo_update(ppo_state, bootstrap_observation=None):
             actor_grad_norm_value = float(actor_grad_norm.item())
             critic_grad_norm_value = float(critic_grad_norm.item())
 
-    # Paper eq.: lambda <- [lambda + eta * (E[C_episode] - d)]+, using episodes completed since the last update.
+    # Paper eq.: lambda <- [lambda + eta * (E[C] - d)]+, over episodes finished since the last
+    # update. C is the per-tick mean cost and d/eta are rescaled to match; see
+    # PPO_NOMINAL_EPISODE_TICKS for why this is not the per-episode sum the paper writes.
     episode_costs = ppo_state["episode_costs"]
     mean_episode_cost = None
     if episode_costs:
@@ -1838,7 +1858,11 @@ def main(args):
                                     terminal_reward,
                                     terminal_cost,
                                 )
-                                ppo_state["episode_costs"].append(episode_stats["cost_sum"])
+                                # Per-tick mean, so a short episode is not cheaper than a long one.
+                                episode_ticks = max(1, episode_stats["ticks"])
+                                ppo_state["episode_costs"].append(
+                                    episode_stats["cost_sum"] / episode_ticks
+                                )
                             _record_ppo_episode(
                                 ppo_state, episode_count, reason, elapsed_sec, rows, episode_stats, dt
                             )
@@ -1984,8 +2008,12 @@ if __name__ == "__main__":
     argparser.add_argument(
         "--ppo-lambda-lr",
         type=float,
-        default=0.01,
-        help="Step size eta in lambda <- [lambda + eta*(E[episode cost] - d)]+ (default: 0.01)",
+        default=PPO_LAMBDA_LR_PER_TICK,
+        help=(
+            "Step size eta in lambda <- [lambda + eta*(E[per-tick cost] - d)]+. "
+            f"Paper eta={PPO_PAPER_LAMBDA_LR:g} paired with a per-episode d, rescaled here by the "
+            f"nominal {PPO_NOMINAL_EPISODE_TICKS}-tick episode (default: {PPO_LAMBDA_LR_PER_TICK:g})"
+        ),
     )
     argparser.add_argument("--ppo-initial-lambda", type=float, default=0.0)
     argparser.add_argument(
@@ -2014,8 +2042,12 @@ if __name__ == "__main__":
     argparser.add_argument(
         "--ppo-cost-limit",
         type=float,
-        default=5.0,
-        help="Cumulative THW cost limit d per episode, in ticks (paper Table I, default: 5)",
+        default=PPO_COST_LIMIT_PER_TICK,
+        help=(
+            "Per-tick mean THW cost limit d. "
+            f"Paper Table I gives d={PPO_PAPER_COST_LIMIT:g} as a per-episode sum; divided by the "
+            f"nominal {PPO_NOMINAL_EPISODE_TICKS}-tick episode (default: {PPO_COST_LIMIT_PER_TICK:.6f})"
+        ),
     )
     argparser.add_argument("--ppo-update-epochs", type=int, default=10)
     argparser.add_argument("--ppo-minibatch-size", type=int, default=64)

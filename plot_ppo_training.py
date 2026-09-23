@@ -21,7 +21,7 @@ REFERENCE = "#8a8984"
 
 EPISODE_PANELS = [
     ("episode_reward", "Episode reward (sum)", None),
-    ("episode_cost", "Episode cumulative THW cost", "cost_limit"),
+    ("mean_cost", "Per-tick mean THW cost", "cost_limit"),
     ("mean_action", "Mean action (+ throttle / - brake)", 0.0),
     ("max_follower_speed_mps", "Max follower speed [m/s]", None),
     ("mean_abs_spacing_error_m", "Mean |spacing error| [m]", None),
@@ -30,7 +30,7 @@ EPISODE_PANELS = [
 
 UPDATE_PANELS = [
     ("mean_reward", "Rollout mean reward"),
-    ("mean_episode_cost", "Mean episode cost used for lambda"),
+    ("mean_episode_cost", "Per-tick mean cost used for lambda"),
     ("lambda", "Lagrange multiplier (lambda)"),
     ("entropy", "Policy entropy"),
     ("actor_loss", "Actor loss"),
@@ -111,8 +111,8 @@ def main():
     parser.add_argument(
         "--cost-limit",
         type=float,
-        default=5.0,
-        help="Per-episode cumulative cost limit d drawn on the cost panels (default: 5)",
+        default=5.0 / 650.0,
+        help="Per-tick mean cost limit d drawn on the cost panels (default: 5/650)",
     )
     args = parser.parse_args()
 
