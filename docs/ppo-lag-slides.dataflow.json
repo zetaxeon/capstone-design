@@ -1,0 +1,215 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "PPO-Lagrangian 학습 구조 (발표자료 5~8쪽)",
+    "quality_profile": "showcase",
+    "legend": {
+      "entries": {
+        "security": {
+          "label": "안전 제약 (cost · λ)"
+        },
+        "dashed": {
+          "label": "학습 갱신"
+        }
+      }
+    },
+    "viewBox": [
+      1068,
+      680
+    ],
+    "output": "ppo-lag-slides.html"
+  },
+  "stages": [
+    {
+      "label": "환경"
+    },
+    {
+      "label": "관측 · 채점"
+    },
+    {
+      "label": "행동 · 수집"
+    },
+    {
+      "label": "평가"
+    },
+    {
+      "label": "λ · 갱신"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "carla",
+      "type": "external",
+      "label": "CARLA 환경",
+      "sublabel": "Leader + Follower",
+      "tag": "tick 0.05 s",
+      "stage": 0,
+      "row": 1
+    },
+    {
+      "id": "state",
+      "type": "frontend",
+      "label": "상태 s",
+      "sublabel": "Δd · Δv · a_L · v",
+      "tag": "4차원",
+      "stage": 1,
+      "row": 0
+    },
+    {
+      "id": "score",
+      "type": "security",
+      "label": "보상 r · cost c",
+      "sublabel": "추종 · jerk / THW",
+      "tag": "수정 ② 충돌 cost",
+      "stage": 1,
+      "row": 2
+    },
+    {
+      "id": "actor",
+      "type": "backend",
+      "label": "Actor π",
+      "sublabel": "a ∈ [−1, 1]",
+      "tag": "0.5 s 유지",
+      "stage": 2,
+      "row": 0
+    },
+    {
+      "id": "buffer",
+      "type": "messagebus",
+      "label": "Rollout buffer",
+      "sublabel": "512 decisions",
+      "tag": "s · a · r · c",
+      "stage": 2,
+      "row": 2
+    },
+    {
+      "id": "critics",
+      "type": "backend",
+      "label": "Critic V_r · V_c",
+      "sublabel": "보상 · cost 예측",
+      "tag": "수정 ① 분리",
+      "stage": 3,
+      "row": 1
+    },
+    {
+      "id": "lambda",
+      "type": "security",
+      "label": "λ 갱신",
+      "sublabel": "λ + η(J_c − d)",
+      "tag": "수정 ③ tick 평균",
+      "stage": 4,
+      "row": 2
+    },
+    {
+      "id": "update",
+      "type": "backend",
+      "label": "PPO 업데이트",
+      "sublabel": "(Â_r − λÂ_c)/(1+λ)",
+      "tag": "clip 0.2",
+      "stage": 4,
+      "row": 0
+    }
+  ],
+  "flows": [
+    {
+      "id": "observe",
+      "from": "carla",
+      "to": "state",
+      "label": "관측",
+      "variant": "emphasis"
+    },
+    {
+      "id": "decide",
+      "from": "state",
+      "to": "actor",
+      "label": "s",
+      "variant": "emphasis"
+    },
+    {
+      "id": "act",
+      "from": "actor",
+      "to": "carla",
+      "label": "throttle / brake",
+      "variant": "emphasis",
+      "route": "top-channel"
+    },
+    {
+      "id": "grade",
+      "from": "carla",
+      "to": "score",
+      "label": "매 tick"
+    },
+    {
+      "id": "store",
+      "from": "score",
+      "to": "buffer",
+      "label": "r, c"
+    },
+    {
+      "id": "batch",
+      "from": "buffer",
+      "to": "critics",
+      "label": "512개"
+    },
+    {
+      "id": "jc",
+      "from": "buffer",
+      "to": "lambda",
+      "label": "J_c",
+      "variant": "security",
+      "route": "straight"
+    },
+    {
+      "id": "adv",
+      "from": "critics",
+      "to": "update",
+      "label": "Â_r, Â_c",
+      "variant": "emphasis"
+    },
+    {
+      "id": "lam",
+      "from": "lambda",
+      "to": "update",
+      "label": "λ",
+      "variant": "security"
+    },
+    {
+      "id": "learn",
+      "from": "update",
+      "to": "actor",
+      "label": "정책 갱신",
+      "variant": "dashed",
+      "route": "straight"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "주행 루프 (5쪽 위)",
+      "items": [
+        "CARLA → 상태 s → Actor → throttle / brake → CARLA를 0.5 s마다 반복",
+        "매 tick 보상 r과 cost c를 매겨 buffer에 쌓음",
+        "512개가 모이면 Critic과 λ로 정책을 한 번 갱신"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "핵심 수정 3가지 (6쪽)",
+      "items": [
+        "① Actor / Critic 분리: critic gradient가 ~380배 커서 정책이 안 바뀌던 문제",
+        "② 충돌에 최대 cost 1/(1−γ): 충돌이 근접 주행보다 싸 보이던 문제",
+        "③ J_c를 tick 평균으로 (d = 5/650): 일찍 실패하면 제약을 지킨 것처럼 보이던 문제"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "500 ep 결과 (7~8쪽)",
+      "items": [
+        "간격 오차 15.9 → 3.4 m, 마지막 50 ep 완주 49 / 50",
+        "λ 0 → 4.07 → 2.94: 충돌이 많을 때 오르고 안전해지면 내려옴",
+        "남은 문제: jerk ≈ 19 m/s³ 그대로, truncation 미검증"
+      ]
+    }
+  ]
+}
