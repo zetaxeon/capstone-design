@@ -18,14 +18,19 @@ TEXT_SECONDARY = "#52514e"
 GRID = "#e4e3df"
 SERIES = "#2a78d6"
 REFERENCE = "#8a8984"
+THW_SAFE_SEC = 1.2  # tau_safe in episode_ppo_v2.py
+# Episodes where the follower never launches have THW_min ~35 s; clip so the converged band stays visible.
+THW_MIN_YLIM = (0.0, 4.0)
 
 EPISODE_PANELS = [
-    ("episode_reward", "Episode reward (sum)", None),
-    ("mean_cost", "Per-tick mean THW cost", "cost_limit"),
-    ("mean_action", "Mean action (+ throttle / - brake)", 0.0),
-    ("max_follower_speed_mps", "Max follower speed [m/s]", None),
-    ("mean_abs_spacing_error_m", "Mean |spacing error| [m]", None),
-    ("sim_time_sec", "Episode length [s, sim time]", None),
+    ("episode_reward", "Episode reward (sum)", None, None),
+    ("mean_cost", "Per-tick mean THW cost", "cost_limit", None),
+    ("mean_action", "Mean action (+ throttle / - brake)", 0.0, None),
+    ("mean_abs_jerk_mps3", "Mean |jerk| [m/s³]", None, None),
+    ("max_follower_speed_mps", "Max follower speed [m/s]", None, None),
+    ("mean_abs_spacing_error_m", "Mean |spacing error| [m]", None, None),
+    ("sim_time_sec", "Episode length [s, sim time]", None, None),
+    ("thw_min_s", "THW_min [s] (y clipped to 0-4)", "thw_safe", THW_MIN_YLIM),
 ]
 
 UPDATE_PANELS = [
@@ -68,13 +73,13 @@ def _save(fig, out_path, suptitle):
     print(f"Saved figure: {out_path}")
 
 
-def _draw_cost_limit(ax, cost_limit):
-    ax.axhline(cost_limit, color=REFERENCE, linewidth=1.0, linestyle="--")
+def _draw_reference(ax, value, label, below=False):
+    ax.axhline(value, color=REFERENCE, linewidth=1.0, linestyle="--")
     ax.annotate(
-        f"cost limit d={cost_limit:g}",
-        xy=(1, cost_limit),
+        label,
+        xy=(1, value),
         xycoords=("axes fraction", "data"),
-        xytext=(0, 4),
+        xytext=(0, -12 if below else 4),
         textcoords="offset points",
         ha="right",
         fontsize=8,
@@ -82,15 +87,26 @@ def _draw_cost_limit(ax, cost_limit):
     )
 
 
+def _draw_cost_limit(ax, cost_limit):
+    _draw_reference(ax, cost_limit, f"cost limit d={cost_limit:g}")
+
+
 def plot_episodes(df, out_path, window, cost_limit):
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8), facecolor=SURFACE)
-    for ax, (key, title, reference) in zip(axes.ravel(), EPISODE_PANELS):
+    fig, axes = plt.subplots(2, 4, figsize=(20, 8), facecolor=SURFACE)
+    for ax, (key, title, reference, ylim) in zip(axes.ravel(), EPISODE_PANELS):
         _style_axis(ax, title, "episode")
+        if key not in df:
+            ax.text(0.5, 0.5, f"{key} not logged", transform=ax.transAxes, ha="center", color=TEXT_SECONDARY)
+            continue
         if reference == "cost_limit":
             _draw_cost_limit(ax, cost_limit)
+        elif reference == "thw_safe":
+            _draw_reference(ax, THW_SAFE_SEC, f"τ_safe = {THW_SAFE_SEC:g} s", below=True)
         elif reference is not None:
             ax.axhline(reference, color=REFERENCE, linewidth=1.0, linestyle="--")
         _plot_series(ax, df["episode"], df[key], window)
+        if ylim is not None:
+            ax.set_ylim(*ylim)
     _save(fig, out_path, f"PPO training by episode ({len(df)} episodes)")
 
 
