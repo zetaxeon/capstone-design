@@ -30,6 +30,7 @@ from ros2_native import (
     load_config_file,
     spawn_actors_from_config,
 )
+from v2v_comm import create_channels
 
 
 DEFAULT_SCENARIO_FILE = Path(__file__).parent / "configs" / "scenario_town03.json"
@@ -592,6 +593,8 @@ def _build_basic_agent(vehicle, map_, scenario_config, route_locations, option_o
         start_location = target_location
 
     agent.set_global_plan(route_plan)
+    # The local planner consumes its queue, so keep the full plan for the r_i route offset.
+    agent.planned_route = route_plan
     return agent
 
 
@@ -704,6 +707,18 @@ def _log_follower_metrics(episode_count, tick_count, metrics):
         metrics["brake"],
     )
 
+EPISODE_COMM_ROW_FIELDS = [
+    "comm_success",
+    "comm_flag",
+    "t_since_comm_s",
+    "lead_accel_true_mps2",
+    "lead_accel_obs_mps2",
+    "obs_spacing_error_m",
+    "obs_relative_velocity_mps",
+    "lateral_offset_m",
+]
+
+
 def _write_episode_csv(output_dir, episode_count, rows, controller="pid"):
     if not rows:
         return
@@ -727,6 +742,8 @@ def _write_episode_csv(output_dir, episode_count, rows, controller="pid"):
         "throttle",
         "brake",
     ]
+    # Comm columns only exist on PPO rows, so PID CSVs keep their original header.
+    fieldnames += [name for name in EPISODE_COMM_ROW_FIELDS if name in rows[0]]
 
     with csv_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -837,9 +854,13 @@ def _print_spawn_points(world):
 
 # ---------------------------------------------------------------------------
 # PPO-Lagrangian longitudinal controller (baseline: team ITSC 2026 manuscript)
-# Observation: [spacing_error Δd, relative_velocity Δv, leader_accel a_(i-1), follower_speed v_i]
-#   Paper eq. (8) also has lateral offset r_i, comm-failure flag, and packet age t_i;
-#   those are deferred until the V2V loss model (Last Value Hold) is added.
+# Observation, paper eq. (8):
+#   obs_dim 7: [Δd^last, Δv^last, a_(i-1)^last, v_i, r_i, flag_i, t_i]
+#   obs_dim 4: [Δd^last, Δv^last, a_(i-1)^last, v_i]   (pre-comm layout; 10/26 checkpoint)
+# The ^last terms come through the V2V channel (v2v_comm.py, Algorithm 1 line 10): on a lost
+# packet the preceding vehicle's location, speed, and acceleration are held, and Δd, Δv are
+# recomputed against the follower's own current sensor state. Reward, cost, THW, hard_violation,
+# the emergency brake, and logged metrics always use the true simulator state.
 # Action: scalar in [-1, 1], + => throttle, - => brake (paper eq. 9)
 #
 # Values marked [PAPER] come from Table I. Values marked [ASSUMED] are not specified
@@ -862,7 +883,12 @@ THW_MIN_SPEED_MPS = 0.5       # [ASSUMED] below this speed THW is treated as inf
 # acceleration [m/s^2], matching plot_pid_metrics.py; the paper also uses a_i for the action.
 
 # [ASSUMED] Fixed scales so the policy sees roughly O(1) inputs; not given in the paper.
-PPO_OBS_SCALES = (20.0, 10.0, 5.0, 30.0)
+# Order: Δd [m], Δv [m/s], a_(i-1) [m/s^2], v_i [m/s], r_i [m], flag_i [-], t_i [s].
+PPO_OBS_SCALES = (20.0, 10.0, 5.0, 30.0, 2.0, 1.0, 1.0)
+PPO_OBS_T_CLIP_SEC = 5.0      # [ASSUMED] t_i is clipped to [0, 5] s before scaling
+PPO_SUPPORTED_OBS_DIMS = (4, 7)
+PPO_DEFAULT_OBS_DIM = 7
+PPO_PAPER_P_SUCCESS = 0.9     # [PAPER] Table I p_success
 
 # [ASSUMED] Episode endings counted as follower failure; they receive a terminal penalty.
 PPO_FAILURE_REASONS = ("hard_violation", "follower_collision", "leader_collision")
@@ -902,7 +928,109 @@ PPO_LAMBDA_LR_PER_TICK = PPO_PAPER_LAMBDA_LR * PPO_NOMINAL_EPISODE_TICKS
 
 
 def _normalize_ppo_observation(observation):
-    return [float(value) / scale for value, scale in zip(observation, PPO_OBS_SCALES)]
+    values = [float(value) for value in observation]
+    if len(values) >= 7:
+        values[6] = _clamp(values[6], 0.0, PPO_OBS_T_CLIP_SEC)
+    return [value / scale for value, scale in zip(values, PPO_OBS_SCALES)]
+
+
+def _v2v_sender_state(vehicle):
+    """What one V2V packet from this vehicle carries."""
+    return {
+        "location": vehicle.get_location(),
+        "speed_mps": _get_speed_mps(vehicle),
+        "accel_mps2": _longitudinal_accel_mps2(vehicle),
+    }
+
+
+# [ASSUMED] r_i: signed lateral distance [m] from the follower's planned route, positive to the
+# right of the travel direction. The paper names r_i but does not define it. The route is the
+# BasicAgent global plan (waypoints every sampling_resolution m) treated as a polyline, so r_i
+# stays continuous through lane changes instead of flipping sign at a lane boundary the way a
+# nearest-lane-centerline offset does.
+ROUTE_OFFSET_SEARCH_BACK = 2       # segments behind the last match to re-check
+ROUTE_OFFSET_SEARCH_AHEAD = 25     # segments ahead (~50 m at 2 m spacing; >2 s at 20 m/s)
+
+
+def _create_route_tracker(route_plan):
+    points = []
+    for waypoint, _ in route_plan:
+        location = waypoint.transform.location
+        if not points or math.hypot(location.x - points[-1][0], location.y - points[-1][1]) > 1e-3:
+            points.append((location.x, location.y))
+    return {"points": points, "segment": None}
+
+
+def _route_lateral_offset_m(route_tracker, location):
+    """Signed distance from the closest point on the route polyline, searched in a window
+    around the previous match so a looping route cannot snap to a far-away segment."""
+    points = route_tracker["points"]
+    if len(points) < 2:
+        return 0.0
+    last = route_tracker["segment"]
+    if last is None:
+        first, stop = 0, len(points) - 1
+    else:
+        first = max(0, last - ROUTE_OFFSET_SEARCH_BACK)
+        stop = min(len(points) - 1, last + ROUTE_OFFSET_SEARCH_AHEAD)
+
+    px, py = location.x, location.y
+    best = None
+    for index in range(first, stop):
+        ax, ay = points[index]
+        bx, by = points[index + 1]
+        dx, dy = bx - ax, by - ay
+        length_sq = dx * dx + dy * dy
+        # The first and last segments extend as straight lines: the follower starts behind the
+        # route start and, since the leader brakes to a stop at its destination, rolls ~20 m past
+        # the route end. Clamping there would turn the longitudinal overshoot into "lateral" r_i.
+        u = ((px - ax) * dx + (py - ay) * dy) / length_sq
+        u = _clamp(
+            u,
+            -math.inf if index == 0 else 0.0,
+            math.inf if index == len(points) - 2 else 1.0,
+        )
+        distance_sq = (px - ax - u * dx) ** 2 + (py - ay - u * dy) ** 2
+        if best is None or distance_sq < best[0]:
+            # CARLA is left-handed: the right-hand normal of (dx, dy) is (-dy, dx).
+            side = -(px - ax) * dy + (py - ay) * dx
+            best = (distance_sq, index, side)
+
+    distance_sq, index, side = best
+    route_tracker["segment"] = index
+    return math.copysign(math.sqrt(distance_sq), side)
+
+
+def _ppo_comm_observation(metrics, reading, follower_vehicle, lateral_offset_m, obs_dim):
+    """Paper eq. (8) from a V2V reading (held sender state) plus the follower's own sensors."""
+    ego_speed_mps = metrics["ego_speed_mps"]
+    obs_distance_m = _distance_between(reading["location"], follower_vehicle.get_location())
+    obs_spacing_error_m = obs_distance_m - metrics["desired_distance_m"]
+    obs_relative_velocity_mps = reading["speed_mps"] - ego_speed_mps
+    observation = [obs_spacing_error_m, obs_relative_velocity_mps, reading["accel_mps2"], ego_speed_mps]
+    if obs_dim == 7:
+        observation += [lateral_offset_m, float(reading["flag"]), reading["t_since_success_s"]]
+    if not all(math.isfinite(value) for value in observation):
+        raise ValueError(f"Invalid PPO observation: {observation}")
+    return {
+        "observation": observation,
+        "obs_spacing_error_m": obs_spacing_error_m,
+        "obs_relative_velocity_mps": obs_relative_velocity_mps,
+        "lead_accel_obs_mps2": reading["accel_mps2"],
+        "lateral_offset_m": lateral_offset_m,
+        "comm_success": int(reading["success"]),
+        "comm_flag": reading["flag"],
+        "t_since_comm_s": reading["t_since_success_s"],
+    }
+
+
+def _checkpoint_obs_dim(payload):
+    """obs_dim stored in the checkpoint, or inferred from the actor's first layer (pre-comm files)."""
+    if isinstance(payload, dict) and "obs_dim" in payload:
+        return int(payload["obs_dim"])
+    state_dict = payload.get("model", payload) if isinstance(payload, dict) else {}
+    weight = state_dict.get("actor_mean.0.weight") if isinstance(state_dict, dict) else None
+    return int(weight.shape[1]) if weight is not None else 4
 
 
 # The reward critic learns returns in normalized units (running mean/std of the GAE targets),
@@ -995,8 +1123,32 @@ def _create_ppo_state(args, scenario_config):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+    checkpoint_path = Path(args.ppo_checkpoint)
+    if args.ppo_eval and not checkpoint_path.exists():
+        raise SystemExit(f"--ppo-eval needs a trained checkpoint, but {checkpoint_path} does not exist.")
+
+    payload = None
+    if checkpoint_path.exists() and args.ppo_fresh and not args.ppo_eval:
+        logging.warning("--ppo-fresh: ignoring %s; it will be overwritten at the first PPO update.", checkpoint_path)
+    elif checkpoint_path.exists():
+        payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    # A loaded checkpoint decides the observation layout; --obs-dim only picks it for fresh runs
+    # and is otherwise a consistency check.
+    if payload is not None:
+        obs_dim = _checkpoint_obs_dim(payload)
+        if args.obs_dim is not None and args.obs_dim != obs_dim:
+            raise SystemExit(
+                f"--obs-dim {args.obs_dim} does not match {checkpoint_path}, which was trained with "
+                f"obs_dim={obs_dim}. Drop --obs-dim or use --ppo-fresh."
+            )
+    else:
+        obs_dim = args.obs_dim if args.obs_dim is not None else PPO_DEFAULT_OBS_DIM
+    if obs_dim not in PPO_SUPPORTED_OBS_DIMS:
+        raise SystemExit(f"Unsupported obs_dim={obs_dim}; expected one of {PPO_SUPPORTED_OBS_DIMS}.")
+
     model = _PPOLagPolicy(
-        obs_dim=4,
+        obs_dim=obs_dim,
         hidden_dim=int(ppo_config.get("hidden_dim", args.ppo_hidden_dim)),
     ).to(device)
 
@@ -1007,14 +1159,7 @@ def _create_ppo_state(args, scenario_config):
     update_count = 0
     return_stats = _create_return_stats()
 
-    checkpoint_path = Path(args.ppo_checkpoint)
-    if args.ppo_eval and not checkpoint_path.exists():
-        raise SystemExit(f"--ppo-eval needs a trained checkpoint, but {checkpoint_path} does not exist.")
-
-    if checkpoint_path.exists() and args.ppo_fresh and not args.ppo_eval:
-        logging.warning("--ppo-fresh: ignoring %s; it will be overwritten at the first PPO update.", checkpoint_path)
-    elif checkpoint_path.exists():
-        payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if payload is not None:
         try:
             model.load_state_dict(payload.get("model", payload))
         except RuntimeError as exc:
@@ -1032,10 +1177,11 @@ def _create_ppo_state(args, scenario_config):
             if "critic_optimizer" in payload:
                 critic_optimizer.load_state_dict(payload["critic_optimizer"])
         logging.info(
-            "Loaded PPO checkpoint: %s (update=%d lambda=%.4f)",
+            "Loaded PPO checkpoint: %s (update=%d lambda=%.4f obs_dim=%d)",
             checkpoint_path,
             update_count,
             lagrange_multiplier,
+            obs_dim,
         )
 
     # Per-run metric logs start fresh, matching how episode CSVs are rewritten from 001 each run.
@@ -1051,6 +1197,8 @@ def _create_ppo_state(args, scenario_config):
     return {
         "device": device,
         "model": model,
+        "obs_dim": obs_dim,
+        "seed": seed,
         "actor_optimizer": actor_optimizer,
         "critic_optimizer": critic_optimizer,
         "lambda": lagrange_multiplier,
@@ -1367,6 +1515,7 @@ def _ppo_update(ppo_state, bootstrap_observation=None):
             "update_count": ppo_state["update_count"],
             "lambda": lagrange_value,
             "return_stats": ppo_state["return_stats"],
+            "obs_dim": ppo_state["obs_dim"],
         },
         checkpoint_path,
     )
@@ -1432,6 +1581,10 @@ PPO_EPISODE_FIELDS = [
     "thw_min_s",
     "mean_abs_jerk_mps3",
     "min_distance_m",
+    "comm_ticks",
+    "comm_failures",
+    "comm_max_consecutive_failures",
+    "comm_max_t_since_success_s",
 ]
 
 
@@ -1485,7 +1638,9 @@ def _record_ppo_update(ppo_state, result, episode_count):
     _append_csv_row(ppo_state["updates_csv"], PPO_UPDATE_FIELDS, row)
 
 
-def _record_ppo_episode(ppo_state, episode_count, end_reason, elapsed_sec, rows, episode_stats, dt):
+def _record_ppo_episode(
+    ppo_state, episode_count, end_reason, elapsed_sec, rows, episode_stats, dt, comm_summary=None
+):
     if not rows or episode_stats["ticks"] == 0:
         return
     n = len(rows)
@@ -1516,6 +1671,7 @@ def _record_ppo_episode(ppo_state, episode_count, end_reason, elapsed_sec, rows,
         "mean_abs_jerk_mps3": round(sum(jerks) / len(jerks), 5) if jerks else "",
         "min_distance_m": min(r["distance_m"] for r in rows),
     }
+    row.update(comm_summary or {})
     _append_csv_row(ppo_state["episodes_csv"], PPO_EPISODE_FIELDS, row)
 
 
@@ -1564,6 +1720,7 @@ def main(args):
     original_settings = None
     traffic_manager = None
     ppo_state = None
+    comm_channels = {}
     episode_count = 0
 
     try:
@@ -1614,6 +1771,15 @@ def main(args):
                 ppo_state["gamma"],
                 ppo_state["rollout_steps"],
             )
+            # One channel per follower, keyed by receiver. An N-follower platoon (Algorithm 1
+            # line 21) extends this chain with ("follower_2", "follower"), ...
+            comm_channels = create_channels([("follower", "leader")], args.p_success, ppo_state["seed"])
+            logging.info(
+                "V2V comm: p_success=%.3f obs_dim=%d seed=%d (per-episode reseed)",
+                args.p_success,
+                ppo_state["obs_dim"],
+                ppo_state["seed"],
+            )
 
         while True:
             vehicles = []
@@ -1662,12 +1828,16 @@ def main(args):
                         "ignore_vehicles": True,
                     },
                 )
+                follower_route_tracker = _create_route_tracker(follower_agent.planned_route)
                 leader_profile_state = _create_speed_profile_state(scenario_config, _get_speed_mps(leader_vehicle))
                 follower_pid_state = _create_follower_pid_state(scenario_config)
                 _update_spectator(world, [leader_vehicle, follower_vehicle], spectator_config)
 
                 episode_count += 1
                 rows = []  # ← 이 줄 추가
+                # Algorithm 1 line 4: reset communication memory to the sender's actual state.
+                for channel in comm_channels.values():
+                    channel.reset(episode_count, _v2v_sender_state(vehicles_by_id[channel.sender_id]))
                 logging.info(
                     "Episode %d started (leader target speed %.1f m/s)",
                     episode_count,
@@ -1725,6 +1895,23 @@ def main(args):
                     ppo_thw = None
 
                     if args.controller == "ppo":
+                        # Algorithm 1 lines 9-11: observe after the tick, push one packet through
+                        # the channel, then build S(t+1) from held sender state + own sensors.
+                        follower_comm = comm_channels["follower"]
+                        comm_reading = follower_comm.step(
+                            _v2v_sender_state(vehicles_by_id[follower_comm.sender_id]), dt
+                        )
+                        follower_metrics.update(
+                            _ppo_comm_observation(
+                                follower_metrics,
+                                comm_reading,
+                                follower_vehicle,
+                                _route_lateral_offset_m(
+                                    follower_route_tracker, follower_vehicle.get_location()
+                                ),
+                                ppo_state["obs_dim"],
+                            )
+                        )
                         # Current state is the outcome of the action chosen on the previous tick.
                         ppo_reward, ppo_cost, ppo_thw, ppo_penalty = _ppo_reward_and_cost(
                             follower_metrics,
@@ -1806,6 +1993,17 @@ def main(args):
                         "throttle": round(follower_metrics["throttle"], 3),
                         "brake": round(follower_metrics["brake"], 3),
                     })
+                    if args.controller == "ppo":
+                        rows[-1].update({
+                            "comm_success": follower_metrics["comm_success"],
+                            "comm_flag": follower_metrics["comm_flag"],
+                            "t_since_comm_s": round(follower_metrics["t_since_comm_s"], 3),
+                            "lead_accel_true_mps2": round(follower_metrics["lead_accel_mps2"], 4),
+                            "lead_accel_obs_mps2": round(follower_metrics["lead_accel_obs_mps2"], 4),
+                            "obs_spacing_error_m": round(follower_metrics["obs_spacing_error_m"], 3),
+                            "obs_relative_velocity_mps": round(follower_metrics["obs_relative_velocity_mps"], 3),
+                            "lateral_offset_m": round(follower_metrics["lateral_offset_m"], 3),
+                        })
                    
                     if tick_count % follower_pid_state["log_interval_ticks"] == 0:
                         _log_follower_metrics(episode_count, tick_count, follower_metrics)
@@ -1867,8 +2065,18 @@ def main(args):
                                 ppo_state["episode_costs"].append(
                                     episode_stats["cost_sum"] / episode_ticks
                                 )
+                            comm_summary = comm_channels["follower"].summary()
+                            logging.info(
+                                "Episode %d comm: failures=%d/%d max_consecutive=%d max_t_i=%.2fs",
+                                episode_count,
+                                comm_summary["comm_failures"],
+                                comm_summary["comm_ticks"],
+                                comm_summary["comm_max_consecutive_failures"],
+                                comm_summary["comm_max_t_since_success_s"],
+                            )
                             _record_ppo_episode(
-                                ppo_state, episode_count, reason, elapsed_sec, rows, episode_stats, dt
+                                ppo_state, episode_count, reason, elapsed_sec, rows, episode_stats, dt,
+                                comm_summary,
                             )
                         _write_episode_csv(args.output_dir, episode_count, rows, controller=csv_name)
                         break
@@ -2007,6 +2215,27 @@ if __name__ == "__main__":
         help="Ignore an existing checkpoint and start training from scratch (the file is overwritten)",
     )
     argparser.add_argument("--seed", type=int, default=42)
+    argparser.add_argument(
+        "--p-success",
+        type=float,
+        default=PPO_PAPER_P_SUCCESS,
+        help=(
+            "Per-tick V2V packet success probability for the PPO follower (Algorithm 1 line 10). "
+            f"Paper Table I: {PPO_PAPER_P_SUCCESS:g}. Use 1.0 for ideal communication "
+            f"(default: {PPO_PAPER_P_SUCCESS:g})"
+        ),
+    )
+    argparser.add_argument(
+        "--obs-dim",
+        type=int,
+        choices=PPO_SUPPORTED_OBS_DIMS,
+        default=None,
+        help=(
+            "PPO state layout: 7 = paper eq. (8) with r_i, flag_i, t_i; 4 = pre-comm layout. "
+            "A loaded checkpoint sets this automatically; for fresh runs the default is "
+            f"{PPO_DEFAULT_OBS_DIM}"
+        ),
+    )
     argparser.add_argument("--ppo-hidden-dim", type=int, default=128)
     argparser.add_argument("--ppo-lr", type=float, default=3e-4)
     argparser.add_argument(
