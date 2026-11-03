@@ -716,6 +716,7 @@ EPISODE_COMM_ROW_FIELDS = [
     "obs_spacing_error_m",
     "obs_relative_velocity_mps",
     "lateral_offset_m",
+    "emergency_brake",
 ]
 
 
@@ -903,6 +904,20 @@ PPO_MAX_TICK_COST = 1.0       # _thw_cost saturates at 1.0 per tick
 # instead of letting done=True regress the critic toward 0. profile_completed stays terminal:
 # there the leader has parked and the follower has stopped, so there is genuinely nothing left.
 PPO_TRUNCATION_REASONS = ("timeout", "leader_stuck")
+
+# [DEVIATION] Emergency-brake entry cost and override masking (not in the paper).
+# The 5 m emergency brake overrides the policy silently, and THW is undefined below 0.5 m/s, so
+# the policy never saw creeping into the override zone as unsafe: it learned to rely on the
+# override at the final stop. The first tick of an episode on which the override engages is
+# charged K = d_episode / r_target once. K enters the tick cost like any THW tick (so the 10-tick
+# window, the cost critic, and the lambda input all see it), and with d = 5 and r_target = 0.1 the
+# constraint starts pushing when more than ~1 episode in 10 enters the override.
+# A per-tick indicator was rejected: one entry then costs ~20 (set by the 1 s stop-hold, not by
+# design), and a replay of the comm09 training logs left lambda near 0 after episode 1000.
+# Decision windows whose every executed tick was overridden are masked out of the actor loss:
+# the executed control did not depend on the sampled action. Both critics still train on them.
+# --emergency-target-rate 0 disables both and reproduces commit 819fd81.
+PPO_EMERGENCY_TARGET_RATE = 0.1   # [ASSUMED] r_target, tolerated share of override episodes
 
 # The lambda constraint is measured per tick, not per episode.
 #
@@ -1194,6 +1209,21 @@ def _create_ppo_state(args, scenario_config):
     # gamma is given per simulator tick; convert so the discount horizon in seconds is unchanged.
     gamma_per_tick = float(ppo_config.get("gamma", args.ppo_gamma))
 
+    cost_limit = float(ppo_config.get("cost_limit", args.ppo_cost_limit))
+    emergency_target_rate = float(ppo_config.get("emergency_target_rate", args.emergency_target_rate))
+    if emergency_target_rate < 0.0:
+        raise SystemExit(f"--emergency-target-rate must be >= 0, got {emergency_target_rate}")
+    # K = d_episode / r_target, with d_episode the per-episode limit the per-tick d was scaled from.
+    emergency_entry_cost = (
+        cost_limit * PPO_NOMINAL_EPISODE_TICKS / emergency_target_rate if emergency_target_rate > 0.0 else 0.0
+    )
+    logging.info(
+        "Emergency-brake entry cost: %s",
+        f"K={emergency_entry_cost:.2f} (r_target={emergency_target_rate:g}), override masking on"
+        if emergency_target_rate > 0.0
+        else "off (cost is THW only, no override masking)",
+    )
+
     return {
         "device": device,
         "model": model,
@@ -1214,7 +1244,9 @@ def _create_ppo_state(args, scenario_config):
         "entropy_coef": float(ppo_config.get("entropy_coef", args.ppo_entropy_coef)),
         "value_coef": float(ppo_config.get("value_coef", args.ppo_value_coef)),
         "cost_value_coef": float(ppo_config.get("cost_value_coef", args.ppo_cost_value_coef)),
-        "cost_limit": float(ppo_config.get("cost_limit", args.ppo_cost_limit)),
+        "cost_limit": cost_limit,
+        "emergency_entry_cost": emergency_entry_cost,
+        "override_masking": emergency_target_rate > 0.0,
         "update_epochs": int(ppo_config.get("update_epochs", args.ppo_update_epochs)),
         "minibatch_size": int(ppo_config.get("minibatch_size", args.ppo_minibatch_size)),
         "rollout_steps": int(ppo_config.get("rollout_steps", args.ppo_rollout_steps)),
@@ -1330,12 +1362,25 @@ def _ppo_value_estimate(ppo_state, observation):
     )
 
 
-def _append_ppo_transition(ppo_state, policy_step, reward, cost, done):
+def _append_ppo_transition(ppo_state, policy_step, reward, cost, done, actor_mask=1.0):
     transition = dict(policy_step)
     transition["reward"] = float(reward)
     transition["cost"] = float(cost)
     transition["done"] = bool(done)
+    transition["actor_mask"] = float(actor_mask)
     ppo_state["buffer"].append(transition)
+
+
+def _window_actor_mask(ppo_state, override_flags, window_ticks):
+    """0 when the emergency brake overrode every executed tick of this decision window, else 1.
+
+    override_flags holds one entry per control computed in the window. On the last window of an
+    episode the final control is never executed, so only the first window_ticks entries count.
+    """
+    if not ppo_state["override_masking"] or window_ticks <= 0:
+        return 1.0
+    executed = override_flags[:window_ticks]
+    return 0.0 if len(executed) == window_ticks and all(executed) else 1.0
 
 
 def _finish_ppo_episode(
@@ -1346,6 +1391,7 @@ def _finish_ppo_episode(
     window_ticks,
     terminal_reward=0.0,
     terminal_cost=0.0,
+    actor_mask=1.0,
 ):
     if pending_step is not None and window_ticks > 0:
         _append_ppo_transition(
@@ -1354,6 +1400,7 @@ def _finish_ppo_episode(
             reward_sum / window_ticks + terminal_reward,
             cost_sum / window_ticks + terminal_cost,
             True,
+            actor_mask,
         )
     elif ppo_state["buffer"]:
         ppo_state["buffer"][-1]["reward"] += terminal_reward
@@ -1420,8 +1467,15 @@ def _ppo_update(ppo_state, bootstrap_observation=None):
     reward_ret = (reward_ret - return_stats["mean"]) / _return_std(return_stats)
     cost_ret = torch.tensor(cost_returns, dtype=torch.float32, device=device)
 
-    reward_adv = (reward_adv - reward_adv.mean()) / (reward_adv.std(unbiased=False) + 1e-8)
-    cost_adv = (cost_adv - cost_adv.mean()) / (cost_adv.std(unbiased=False) + 1e-8)
+    # Override-masked windows (see PPO_EMERGENCY_TARGET_RATE) stay in GAE and both critic losses
+    # but are left out of the actor loss, the entropy term, and the advantage statistics.
+    actor_masks = torch.tensor(
+        [item.get("actor_mask", 1.0) for item in buffer], dtype=torch.float32, device=device
+    )
+    masked_transitions = int((actor_masks == 0).sum().item())
+    stat_mask = actor_masks > 0 if masked_transitions < len(buffer) else torch.ones_like(actor_masks, dtype=torch.bool)
+    reward_adv = (reward_adv - reward_adv[stat_mask].mean()) / (reward_adv[stat_mask].std(unbiased=False) + 1e-8)
+    cost_adv = (cost_adv - cost_adv[stat_mask].mean()) / (cost_adv[stat_mask].std(unbiased=False) + 1e-8)
 
     sample_count = len(buffer)
     minibatch_size = max(1, min(ppo_state["minibatch_size"], sample_count))
@@ -1444,6 +1498,8 @@ def _ppo_update(ppo_state, bootstrap_observation=None):
             batch_cost_adv = cost_adv[indices]
             batch_reward_ret = reward_ret[indices]
             batch_cost_ret = cost_ret[indices]
+            batch_mask = actor_masks[indices]
+            batch_mask_count = batch_mask.sum().clamp_min(1.0)
 
             distribution, reward_values, cost_values = model.distribution(batch_obs)
             raw_actions = _atanh(batch_actions)
@@ -1460,11 +1516,11 @@ def _ppo_update(ppo_state, bootstrap_observation=None):
                 1.0 - ppo_state["clip_ratio"],
                 1.0 + ppo_state["clip_ratio"],
             ) * combined_adv
-            actor_loss = -torch.min(surrogate_1, surrogate_2).mean()
+            actor_loss = -(torch.min(surrogate_1, surrogate_2) * batch_mask).sum() / batch_mask_count
 
             reward_value_loss = torch.nn.functional.mse_loss(reward_values, batch_reward_ret)
             cost_value_loss = torch.nn.functional.mse_loss(cost_values, batch_cost_ret)
-            entropy = distribution.entropy().sum(dim=-1).mean()
+            entropy = (distribution.entropy().sum(dim=-1) * batch_mask).sum() / batch_mask_count
 
             policy_loss = actor_loss - ppo_state["entropy_coef"] * entropy
             critic_loss = (
@@ -1534,6 +1590,7 @@ def _ppo_update(ppo_state, bootstrap_observation=None):
         "mean_reward": sum(item["reward"] for item in buffer) / sample_count,
         "mean_cost": sum(item["cost"] for item in buffer) / sample_count,
         "mean_episode_cost": mean_episode_cost,
+        "masked_transitions": masked_transitions,
         "lambda": lagrange_value,
         "update_count": ppo_state["update_count"],
     }
@@ -1548,6 +1605,7 @@ PPO_UPDATE_FIELDS = [
     "mean_reward",
     "mean_cost",
     "mean_episode_cost",
+    "masked_transitions",
     "lambda",
     "entropy",
     "actor_loss",
@@ -1570,6 +1628,9 @@ PPO_EPISODE_FIELDS = [
     "mean_reward",
     "episode_cost",
     "mean_cost",
+    "episode_thw_cost",
+    "emergency_entered",
+    "emergency_ticks",
     "collision",
     "mean_action",
     "max_follower_speed_mps",
@@ -1624,6 +1685,7 @@ def _record_ppo_update(ppo_state, result, episode_count):
         "mean_reward": round(result["mean_reward"], 5),
         "mean_cost": round(result["mean_cost"], 5),
         "mean_episode_cost": "" if result["mean_episode_cost"] is None else round(result["mean_episode_cost"], 5),
+        "masked_transitions": result["masked_transitions"],
         "lambda": round(result["lambda"], 5),
         "entropy": round(result["entropy"], 5),
         "actor_loss": round(result["actor_loss"], 5),
@@ -1658,6 +1720,9 @@ def _record_ppo_episode(
         "mean_reward": round(episode_stats["reward_sum"] / ticks, 5),
         "episode_cost": round(episode_stats["cost_sum"], 5),
         "mean_cost": round(episode_stats["cost_sum"] / ticks, 5),
+        "episode_thw_cost": round(episode_stats["thw_cost_sum"], 5),
+        "emergency_entered": int(episode_stats["emergency_entered"]),
+        "emergency_ticks": episode_stats["emergency_ticks"],
         "collision": int("collision" in end_reason),
         "mean_action": round(episode_stats["action_sum"] / ticks, 5),
         "max_follower_speed_mps": max(r["follower_speed_mps"] for r in rows),
@@ -1683,7 +1748,7 @@ def _log_ppo_update(result):
             "PPO update %d: samples=%d actor_loss=%.4f reward_v_loss=%.4f "
             "cost_v_loss=%.4f entropy=%.4f log_std=%.4f actor_grad=%.4f critic_grad=%.3f "
             "return_mean=%.2f return_std=%.2f "
-            "mean_reward=%.4f mean_cost=%.4f episode_cost=%s lambda=%.4f"
+            "mean_reward=%.4f mean_cost=%.4f episode_cost=%s masked=%d lambda=%.4f"
         ),
         result["update_count"],
         result["samples"],
@@ -1699,6 +1764,7 @@ def _log_ppo_update(result):
         result["mean_reward"],
         result["mean_cost"],
         "n/a" if result["mean_episode_cost"] is None else f"{result['mean_episode_cost']:.3f}",
+        result["masked_transitions"],
         result["lambda"],
     )
 
@@ -1850,6 +1916,7 @@ def main(args):
                 window_reward_sum = 0.0
                 window_cost_sum = 0.0
                 window_ticks = 0
+                window_override_flags = []
                 episode_stats = {
                     "reward_sum": 0.0,
                     "cost_sum": 0.0,
@@ -1857,6 +1924,9 @@ def main(args):
                     "ticks": 0,
                     "accels": [],
                     "finite_thw": [],
+                    "thw_cost_sum": 0.0,
+                    "emergency_entered": False,
+                    "emergency_ticks": 0,
                 }
                 reward_state = {"prev_accel_mps2": None}
                 ppo_penalty = 0.0
@@ -1917,6 +1987,22 @@ def main(args):
                             follower_metrics,
                             reward_state,
                         )
+                        # The same distance decides the override on the control computed below, so
+                        # this tick's cost lands in the window whose actions drove the car into it.
+                        emergency_active = (
+                            follower_metrics["distance_m"] < follower_pid_state["emergency_distance_m"]
+                        )
+                        ppo_thw_cost = ppo_cost
+                        if emergency_active and not episode_stats["emergency_entered"]:
+                            episode_stats["emergency_entered"] = True
+                            ppo_cost += ppo_state["emergency_entry_cost"]
+                            if ppo_state["emergency_entry_cost"] > 0.0:
+                                logging.info(
+                                    "Episode %d: emergency brake entered at tick %d, entry cost K=%.2f",
+                                    episode_count,
+                                    tick_count,
+                                    ppo_state["emergency_entry_cost"],
+                                )
 
                         if pending_ppo_step is not None:
                             window_reward_sum += ppo_reward
@@ -1932,6 +2018,7 @@ def main(args):
                                     window_reward_sum / window_ticks,
                                     window_cost_sum / window_ticks,
                                     False,
+                                    _window_actor_mask(ppo_state, window_override_flags, window_ticks),
                                 )
 
                             if ppo_state["training"] and len(ppo_state["buffer"]) >= ppo_state["rollout_steps"]:
@@ -1950,6 +2037,7 @@ def main(args):
                             window_reward_sum = 0.0
                             window_cost_sum = 0.0
                             window_ticks = 0
+                            window_override_flags = []
                         follower_control = _ppo_longitudinal_control(
                             pending_ppo_step["action"],
                             follower_control,
@@ -1959,9 +2047,13 @@ def main(args):
 
                         follower_metrics["throttle"] = follower_control.throttle
                         follower_metrics["brake"] = follower_control.brake
+                        follower_metrics["emergency_brake"] = int(emergency_active)
+                        window_override_flags.append(emergency_active)
+                        episode_stats["emergency_ticks"] += int(emergency_active)
 
                         episode_stats["reward_sum"] += ppo_reward
                         episode_stats["cost_sum"] += ppo_cost
+                        episode_stats["thw_cost_sum"] += ppo_thw_cost
                         episode_stats["action_sum"] += pending_ppo_step["action"]
                         episode_stats["ticks"] += 1
                         episode_stats["accels"].append(follower_metrics["ego_accel_mps2"])
@@ -2003,6 +2095,7 @@ def main(args):
                             "obs_spacing_error_m": round(follower_metrics["obs_spacing_error_m"], 3),
                             "obs_relative_velocity_mps": round(follower_metrics["obs_relative_velocity_mps"], 3),
                             "lateral_offset_m": round(follower_metrics["lateral_offset_m"], 3),
+                            "emergency_brake": follower_metrics["emergency_brake"],
                         })
                    
                     if tick_count % follower_pid_state["log_interval_ticks"] == 0:
@@ -2059,6 +2152,7 @@ def main(args):
                                     window_ticks,
                                     terminal_reward,
                                     terminal_cost,
+                                    _window_actor_mask(ppo_state, window_override_flags, window_ticks),
                                 )
                                 # Per-tick mean, so a short episode is not cheaper than a long one.
                                 episode_ticks = max(1, episode_stats["ticks"])
@@ -2286,6 +2380,17 @@ if __name__ == "__main__":
             "Per-tick mean THW cost limit d. "
             f"Paper Table I gives d={PPO_PAPER_COST_LIMIT:g} as a per-episode sum; divided by the "
             f"nominal {PPO_NOMINAL_EPISODE_TICKS}-tick episode (default: {PPO_COST_LIMIT_PER_TICK:.6f})"
+        ),
+    )
+    argparser.add_argument(
+        "--emergency-target-rate",
+        type=float,
+        default=PPO_EMERGENCY_TARGET_RATE,
+        help=(
+            "r_target for the emergency-brake entry cost K = d_episode / r_target, charged once per "
+            "episode on the first override tick; override-only decision windows are also masked out "
+            f"of the actor loss. 0 disables both (cost is THW only, as in 819fd81). "
+            f"(default: {PPO_EMERGENCY_TARGET_RATE:g} -> K=50)"
         ),
     )
     argparser.add_argument("--ppo-update-epochs", type=int, default=10)

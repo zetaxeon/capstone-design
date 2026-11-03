@@ -7,7 +7,7 @@ Code: `episode_ppo_v2.py` (PPO-Lag follower) and `v2v_comm.py` (V2V channel).
 - **[ASSUMED]**: the manuscript does not specify it, so the code picked it. These items need to be either stated in the report or replaced with the paper's real setting.
 - **[DEVIATION]**: the manuscript does specify it, but the code deliberately does it differently.
 
-Last updated: 2026-11-03 (V2V communication model, 7-dim state, r_i changed to the planned-route reference).
+Last updated: 2026-11-03 (V2V communication model, 7-dim state, r_i changed to the planned-route reference; emergency-brake entry cost and override masking).
 
 ---
 
@@ -64,6 +64,8 @@ S_i = [Δd^last, Δv^last, a_{i−1}^last, v_i, r_i, flag_i, t_i]
 | THW computation | THW = ∞ (cost 0) when v_i ≤ 0.5 m/s | [ASSUMED] |
 | Failure terminal penalty | hard_violation and collisions add −penalty/(1−γ) to the reward | [ASSUMED] |
 | Collision terminal cost | Cost += 1/(1−γ) | [ASSUMED] |
+| Emergency-brake entry cost | c_t = c_THW(THW_t) + K·1[first tick of the episode with D_t < d_em], d_em = 5 m (true center-to-center distance), K = d / r_target with r_target = 0.1 → K = 50. It is charged once per episode. It enters the cost critic (folded into the 10-tick window like any tick cost) and the λ update. `--emergency-target-rate 0` disables it and reproduces commit 819fd81. `episode_thw_cost` is logged separately so the paper's THW cost metric stays reportable. The episode CSV also carries `emergency_entered` and `emergency_ticks`, and the tick CSV carries `emergency_brake`. | **[DEVIATION]**: the paper's cost (eq. (14)–(15)) is THW-based only, and the 5 m emergency brake is our own safety layer. The override is silent and THW is undefined below 0.5 m/s, so the policy never saw creeping into the override zone as unsafe. It learned to rely on it at the final stop: 329/500 of run1026's last training episodes entered it, and 19/20 comm09 deterministic eval episodes at p=0.5. A per-tick indicator was rejected: one entry then costs about 20 (set by the 1 s stop-hold, not by design), and replaying the comm09 training logs showed λ would have stayed near 0 after episode 1000. With per-tick normalization, the effective target rate is d·T̄/(650·K) ≈ 10.9% at T̄ ≈ 707 ticks. r_target is [ASSUMED]. |
+| Collision cost and λ (known asymmetry, not changed) | The collision terminal cost 1/(1−γ) is added to the last transition only, so it reaches the cost critic. λ uses `cost_sum / ticks` over the episode's tick costs, which does not include it. A collision therefore moves λ only through the THW ticks before the impact. Meanwhile an emergency-brake entry adds K = 50 to the λ input, so from λ's point of view an entry weighs more than a collision. | Recorded for the report; deliberately left as is |
 | Time-limit endings | timeout and leader_stuck bootstrap with γ·V(s) instead of being treated as terminal | [ASSUMED] (standard handling) |
 | hard_violation | Ends the episode when the spacing error exceeds 40 m | The ending condition is [PAPER] Algorithm 1 line 13; **the 40 m threshold is [ASSUMED]** |
 
@@ -78,6 +80,7 @@ S_i = [Δd^last, Δv^last, a_{i−1}^last, v_i, r_i, flag_i, t_i]
 | Update period | Every 512 decisions in the rollout buffer, regardless of episode boundaries | **[DEVIATION]**: Algorithm 1 updates per episode |
 | λ update period | Per PPO update, using the mean of episodes finished since the previous update | **[DEVIATION]** |
 | Objective | Clipped surrogate (ε = 0.2); combined advantage (A_r − λA_c)/(1+λ) | Clip [ASSUMED]; the (1+λ) normalization follows OmniSafe PPOLag and is not in the paper |
+| Override masking | Transitions whose whole 10-tick window was overridden by the emergency brake get actor_mask = 0. They are excluded from the clipped surrogate, the entropy term, and the advantage normalization statistics, but kept for both critics and GAE. Partially overridden windows are kept. On an episode's last window, only executed ticks count. `masked_transitions` per update is logged in `ppo_updates.csv`. Off when `--emergency-target-rate 0`. | **[DEVIATION]**: not in the paper. The executed control in those windows did not depend on the sampled action, so its log-prob ratio carried no information about the action's effect. |
 | Networks | Separate actor, reward critic, and cost critic; each 2×128 tanh MLP | [ASSUMED] |
 | Optimizer | Adam, lr 3e-4, 10 epochs, minibatch 64, separate grad clip 0.5 for actor and critics | [ASSUMED] |
 | γ, GAE λ | 0.99 per tick (0.99¹⁰ per decision), 0.95 | [ASSUMED] |
@@ -92,7 +95,7 @@ S_i = [Δd^last, Δv^last, a_{i−1}^last, v_i, r_i, flag_i, t_i]
 |---|---|---|
 | Map | Town03_Opt tunnel route, 2 vehicles (Leader + Follower 1) | **[DEVIATION]**: the paper uses Town04 highway with 3 followers |
 | T_s, h, d₀ | 0.05 s, 1.0 s, 7.0 m | [PAPER] |
-| Emergency brake | Brake = 1.0 when center-to-center distance < 5 m (overrides the policy) | [ASSUMED]: not in the paper. Roughly bumper contact. |
+| Emergency brake | Brake = 1.0 when center-to-center distance < 5 m (overrides the policy). The first override tick of an episode is charged the entry cost K (Sec. 3), and fully overridden decision windows are masked out of the actor loss (Sec. 4) | [ASSUMED]: not in the paper. Roughly bumper contact. |
 | Lateral control | BasicAgent (CARLA) steering | Paper uses a centerline-based PID; equivalent role |
 | Policy deployment (line 21) | **Not implemented** | Planned for P4 |
 | ROS2 | Training runs CARLA Python API directly, no ROS2 | **[DEVIATION]** from the paper's ROS2 co-simulation |
