@@ -99,3 +99,25 @@ S_i = [Δd^last, Δv^last, a_{i−1}^last, v_i, r_i, flag_i, t_i]
 | Lateral control | BasicAgent (CARLA) steering | Paper uses a centerline-based PID; equivalent role |
 | Policy deployment (line 21) | **Not implemented** | Planned for P4 |
 | ROS2 | Training runs CARLA Python API directly, no ROS2 | **[DEVIATION]** from the paper's ROS2 co-simulation |
+
+## 6. Tunnel communication zone and controller comparison (added 2026-11-10)
+
+Nothing in this section is in the paper. It exists for the final experiment: V2V success drops while the platoon is in the tunnel, and PPO-Lag, vanilla PPO and PID are compared under the same losses.
+
+| Item | Implementation | Source |
+|---|---|---|
+| Tunnel location | `communication.tunnel.entry/exit` in `configs/scenario_town03.json`: (200.0, −194.0) → (233.3, −60.0), about 151 m of route. Taken from the Town03_Opt tunnel lights (x=201, y=−188 … y=−64) and the roof mesh edge (y=−60) | [ASSUMED] |
+| Inside test | Each portal is projected onto the vehicle's planned route; a vehicle is inside while its own arc length lies between the two | [ASSUMED] |
+| When the link degrades | While **either** the sender or the receiver is inside. Success probability is `--p-tunnel` there and `--p-success` elsewhere, as a step | [ASSUMED] |
+| Loss pattern | Independent per tick by default. `--tunnel-burst-ticks L` switches the tunnel to a Gilbert model: mean loss-run length L ticks, same average success rate | [ASSUMED] |
+| Time-varying probability | `--p-tunnel-noise-std σ`, `--p-tunnel-noise-tau-sec τ`: p(t) = clip(p_tunnel + n(t), 0, 1), n(t) a Gaussian AR(1) process with std σ and correlation time τ (default 1 s), a function of the clock only. τ = 0 (white noise) is statistically identical to a fixed p_tunnel; measured: success 0.698 vs 0.699 and mean loss run 1.43 vs 1.42 ticks at p_tunnel 0.7, σ 0.1 | [ASSUMED] |
+| Training randomization | `--p-tunnel LOW:HIGH` draws one value per episode, uniformly | [ASSUMED] |
+| What a lost packet removes | Leader location, speed and acceleration, as in Sec. 1 (Last Value Hold). Δd therefore also goes stale. The 5 m emergency brake still uses the true distance | Sec. 1 choice, unchanged |
+| What the policy knows | Only flag_i and t_i. Tunnel position is **not** in the state, so the policy has no advance notice of the tunnel | [ASSUMED] |
+| PID under loss | `--controller pid` now reads the leader through the same channel: the PID law and launch assist use the held location and speed. Default `--p-success` for PID is 1.0, which reproduces the previous PID exactly | [ASSUMED] |
+| Shared losses | One uniform number u_t is drawn per tick from a stream seeded by (seed, channel, episode); the packet succeeds when u_t < p. Runs with the same `--seed` share u_t and the leader speed sequence, so controllers differ only on ticks where their zone differs | [ASSUMED] |
+| Leader hard brake in the tunnel | `--leader-brake-prob P`: with probability P per episode the leader, at a point drawn 30–60% of the way through the tunnel, applies full brake (measured about 7 m/s²) down to a full stop, holds 2 s, then accelerates back at the profile's 2 m/s². Whether and where is drawn from a stream seeded by (seed, episode), identical for every controller. `leader_brake_event` in the scenario file or `--leader-brake-low-speed`, `--leader-brake-pedal` change it. Braking only to 5 m/s was tried first and stressed no controller | [ASSUMED] |
+| Episode time limit | `episode.max_time_sec` raised 45 → 60 s, because a brake event at 15 m/s pushed episodes past 45 s. No earlier episode reached 45 s | [ASSUMED] |
+| Vanilla PPO baseline | `--no-lagrangian`: λ fixed at 0. Everything else identical to PPO-Lag | [ASSUMED] |
+| Zone metrics | `analysis/tunnel_summarize.py` cuts each episode into pre / tunnel / recovery (2 s after exit) / final (leader's stop) | [ASSUMED] |
+

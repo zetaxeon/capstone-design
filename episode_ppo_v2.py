@@ -546,6 +546,81 @@ def _apply_speed_profile_to_control(control, profile_state):
     return control
 
 
+# [ASSUMED] Leader hard-brake event inside the tunnel (not in the paper). With probability
+# --leader-brake-prob per episode, when the leader reaches a point drawn inside the tunnel it
+# brakes with a fixed pedal until it is down to low_speed_mps, holds that speed for hold_sec,
+# then accelerates back to the episode's target speed at the profile's accel_mps2. Whether and
+# where it happens comes from its own stream seeded by (seed, episode), so every controller
+# evaluated with the same seed faces the same events.
+LEADER_BRAKE_DEFAULTS = {
+    "position_frac": (0.3, 0.6),   # where in the tunnel, as a fraction of its length
+    "brake": 1.0,                  # brake pedal during the event (measured: about 7 m/s^2)
+    "low_speed_mps": 0.0,          # full stop; braking only to 5 m/s stressed no controller
+    "hold_sec": 2.0,
+}
+
+
+def _create_leader_brake_event(scenario_config, probability, seed, episode, tunnel_arc, overrides=None):
+    event = {"state": "off", "active": 0, "start_time_sec": ""}
+    if probability <= 0.0 or tunnel_arc is None:
+        return event
+    config = dict(LEADER_BRAKE_DEFAULTS)
+    config.update(scenario_config.get("leader_brake_event", {}))
+    config.update({key: value for key, value in (overrides or {}).items() if value is not None})
+    rng = random.Random(f"leader-brake:{int(seed)}:{int(episode)}")
+    happens = rng.random() < probability
+    low, high = config["position_frac"]
+    frac = float(low) + (float(high) - float(low)) * rng.random()
+    if not happens:
+        return event
+    event.update({
+        "state": "armed",
+        "trigger_s": tunnel_arc[0] + frac * (tunnel_arc[1] - tunnel_arc[0]),
+        "brake": float(config["brake"]),
+        "low_speed_mps": float(config["low_speed_mps"]),
+        "hold_sec": float(config["hold_sec"]),
+        "hold_elapsed_sec": 0.0,
+        "speed_cap_mps": None,
+    })
+    return event
+
+
+def _update_leader_brake_event(event, profile_state, agent, leader_s, current_speed_mps, elapsed_sec, dt):
+    """Advance the event and cap the speed the leader's agent is asked to hold."""
+    state = event["state"]
+    if state in ("off", "done"):
+        event["active"] = 0
+        return
+    if state == "armed":
+        if leader_s < event["trigger_s"]:
+            return
+        state = "braking"
+        event["start_time_sec"] = round(elapsed_sec, 3)
+        event["speed_cap_mps"] = event["low_speed_mps"]
+    if state == "braking":
+        if current_speed_mps <= event["low_speed_mps"] + 0.3:
+            state = "holding"
+    elif state == "holding":
+        event["hold_elapsed_sec"] += dt
+        if event["hold_elapsed_sec"] >= event["hold_sec"]:
+            state = "recovering"
+    elif state == "recovering":
+        event["speed_cap_mps"] += profile_state["accel_mps2"] * dt
+        if event["speed_cap_mps"] >= profile_state["commanded_speed_mps"]:
+            state = "done"
+    event["state"] = state
+    event["active"] = int(state in ("braking", "holding", "recovering"))
+    if event["active"]:
+        agent.set_target_speed(min(profile_state["commanded_speed_mps"], event["speed_cap_mps"]) * 3.6)
+
+
+def _apply_leader_brake_event(control, event):
+    if event["state"] == "braking":
+        control.throttle = 0.0
+        control.brake = max(control.brake, event["brake"])
+    return control
+
+
 def _build_basic_agent(vehicle, map_, scenario_config, route_locations, option_overrides=None):
     if not route_locations:
         raise ValueError("Scenario must define route_points and/or destination for BasicAgent.")
@@ -611,13 +686,33 @@ def _longitudinal_accel_mps2(vehicle):
     return accel.x * forward.x + accel.y * forward.y + accel.z * forward.z
 
 
-def _compute_follower_control(leader_vehicle, follower_vehicle, follower_agent, follower_pid_state, dt):
+def _compute_follower_control(
+    leader_vehicle, follower_vehicle, follower_agent, follower_pid_state, dt, leader_reading=None
+):
+    """PID longitudinal control plus the true-state metrics every controller logs.
+
+    leader_reading is the V2V channel reading (held leader location and speed). When given, the
+    PID law and the launch assist run on it, exactly the information the PPO observation gets;
+    with a successful packet it equals the true state. The emergency brake and all logged metrics
+    always use the true simulator state, as on the PPO path.
+    """
     lead_speed_mps = _get_speed_mps(leader_vehicle)
     ego_speed_mps = _get_speed_mps(follower_vehicle)
     distance_m = _distance_between(leader_vehicle.get_location(), follower_vehicle.get_location())
     desired_distance_m = follower_pid_state["d0"] + follower_pid_state["h"] * ego_speed_mps
     spacing_error_m = distance_m - desired_distance_m
     relative_velocity_mps = lead_speed_mps - ego_speed_mps
+
+    if leader_reading is None:
+        ctrl_lead_speed_mps = lead_speed_mps
+        ctrl_spacing_error_m = spacing_error_m
+    else:
+        ctrl_lead_speed_mps = leader_reading["speed_mps"]
+        ctrl_spacing_error_m = (
+            _distance_between(leader_reading["location"], follower_vehicle.get_location())
+            - desired_distance_m
+        )
+    ctrl_relative_velocity_mps = ctrl_lead_speed_mps - ego_speed_mps
 
     lead_accel_mps2 = _longitudinal_accel_mps2(leader_vehicle)
     # Paper eq. (8) with perfect communication: [Δd, Δv, a_(i-1), v_i].
@@ -631,15 +726,15 @@ def _compute_follower_control(leader_vehicle, follower_vehicle, follower_agent, 
         raise ValueError(f"Invalid PPO observation: {observation}")
 
     follower_pid_state["integral_error"] = _clamp(
-        follower_pid_state["integral_error"] + spacing_error_m * dt,
+        follower_pid_state["integral_error"] + ctrl_spacing_error_m * dt,
         -follower_pid_state["integral_limit"],
         follower_pid_state["integral_limit"],
     )
 
     u = (
-        follower_pid_state["kp"] * spacing_error_m
+        follower_pid_state["kp"] * ctrl_spacing_error_m
         + follower_pid_state["ki"] * follower_pid_state["integral_error"]
-        + follower_pid_state["kd"] * relative_velocity_mps
+        + follower_pid_state["kd"] * ctrl_relative_velocity_mps
     )
 
     throttle = 0.0
@@ -653,8 +748,8 @@ def _compute_follower_control(leader_vehicle, follower_vehicle, follower_agent, 
 
     if (
         ego_speed_mps <= follower_pid_state["launch_speed_threshold_mps"]
-        and lead_speed_mps >= follower_pid_state["launch_lead_speed_threshold_mps"]
-        and spacing_error_m >= follower_pid_state["launch_spacing_error_threshold_m"]
+        and ctrl_lead_speed_mps >= follower_pid_state["launch_lead_speed_threshold_mps"]
+        and ctrl_spacing_error_m >= follower_pid_state["launch_spacing_error_threshold_m"]
     ):
         throttle = max(throttle, follower_pid_state["launch_min_throttle"])
         brake = 0.0
@@ -717,6 +812,11 @@ EPISODE_COMM_ROW_FIELDS = [
     "obs_relative_velocity_mps",
     "lateral_offset_m",
     "emergency_brake",
+    "follower_accel_mps2",
+    "follower_in_tunnel",
+    "comm_in_tunnel",
+    "comm_p",
+    "leader_brake_event",
 ]
 
 
@@ -743,7 +843,7 @@ def _write_episode_csv(output_dir, episode_count, rows, controller="pid"):
         "throttle",
         "brake",
     ]
-    # Comm columns only exist on PPO rows, so PID CSVs keep their original header.
+    # Comm columns are appended after the original header, for PID and PPO alike.
     fieldnames += [name for name in EPISODE_COMM_ROW_FIELDS if name in rows[0]]
 
     with csv_path.open("w", newline="") as f:
@@ -973,7 +1073,10 @@ def _create_route_tracker(route_plan):
         location = waypoint.transform.location
         if not points or math.hypot(location.x - points[-1][0], location.y - points[-1][1]) > 1e-3:
             points.append((location.x, location.y))
-    return {"points": points, "segment": None}
+    arc_lengths = [0.0]
+    for (ax, ay), (bx, by) in zip(points, points[1:]):
+        arc_lengths.append(arc_lengths[-1] + math.hypot(bx - ax, by - ay))
+    return {"points": points, "arc_lengths": arc_lengths, "segment": None, "s": 0.0}
 
 
 def _route_lateral_offset_m(route_tracker, location):
@@ -1009,11 +1112,58 @@ def _route_lateral_offset_m(route_tracker, location):
         if best is None or distance_sq < best[0]:
             # CARLA is left-handed: the right-hand normal of (dx, dy) is (-dy, dx).
             side = -(px - ax) * dy + (py - ay) * dx
-            best = (distance_sq, index, side)
+            best = (distance_sq, index, side, u * math.sqrt(length_sq))
 
-    distance_sq, index, side = best
+    distance_sq, index, side, along_m = best
     route_tracker["segment"] = index
+    # Arc length of the matched point from the route start [m]; used for the tunnel zone.
+    route_tracker["s"] = route_tracker["arc_lengths"][index] + along_m
     return math.copysign(math.sqrt(distance_sq), side)
+
+
+# [ASSUMED] Tunnel communication zone (not in the paper). The scenario file marks the tunnel by
+# its two portals, communication.tunnel.entry / exit, as map x, y. Each portal is projected onto
+# a vehicle's planned route once per episode, and the vehicle counts as inside while the arc
+# length of its own position lies between the two. The V2V link is degraded (p_tunnel instead of
+# p_success) while either end of the link, sender or receiver, is inside.
+# The zone flags are logged whenever the scenario defines a tunnel; the link is only degraded
+# when --p-tunnel is given.
+def _tunnel_zone(scenario_config):
+    tunnel = scenario_config.get("communication", {}).get("tunnel")
+    if not tunnel:
+        return None
+    return tuple((float(tunnel[key]["x"]), float(tunnel[key]["y"])) for key in ("entry", "exit"))
+
+
+def _tunnel_arc_range(route_tracker, tunnel_zone):
+    """(s_entry, s_exit) of the tunnel portals along this route, searched over the whole route."""
+    if tunnel_zone is None:
+        return None
+    arc = []
+    for x, y in tunnel_zone:
+        probe = {"points": route_tracker["points"], "arc_lengths": route_tracker["arc_lengths"],
+                 "segment": None, "s": 0.0}
+        _route_lateral_offset_m(probe, carla.Location(x=x, y=y, z=0.0))
+        arc.append(probe["s"])
+    if arc[0] >= arc[1]:
+        raise ValueError(f"Tunnel entry must come before exit along the route, got s={arc}")
+    return tuple(arc)
+
+
+def _in_tunnel(route_tracker, arc_range):
+    return arc_range is not None and arc_range[0] <= route_tracker["s"] <= arc_range[1]
+
+
+def _parse_p_tunnel(text):
+    """'0.5' -> (0.5, 0.5); '0.3:0.7' -> (0.3, 0.7), drawn uniformly once per episode."""
+    if text is None:
+        return None
+    parts = [float(part) for part in str(text).split(":")]
+    if len(parts) == 1:
+        parts *= 2
+    if len(parts) != 2 or not 0.0 <= parts[0] <= parts[1] <= 1.0:
+        raise SystemExit(f"--p-tunnel expects P or LOW:HIGH within [0, 1], got {text!r}")
+    return tuple(parts)
 
 
 def _ppo_comm_observation(metrics, reading, follower_vehicle, lateral_offset_m, obs_dim):
@@ -1209,6 +1359,14 @@ def _create_ppo_state(args, scenario_config):
     # gamma is given per simulator tick; convert so the discount horizon in seconds is unchanged.
     gamma_per_tick = float(ppo_config.get("gamma", args.ppo_gamma))
 
+    lambda_lr = float(ppo_config.get("lambda_lr", args.ppo_lambda_lr))
+    if args.no_lagrangian:
+        # Vanilla PPO baseline: lambda is pinned at 0, so the actor optimizes reward only. The
+        # cost critic, the cost logs and override masking run exactly as in PPO-Lag.
+        lagrange_multiplier = 0.0
+        lambda_lr = 0.0
+        logging.info("Lagrangian disabled (--no-lagrangian): vanilla PPO, lambda fixed at 0")
+
     cost_limit = float(ppo_config.get("cost_limit", args.ppo_cost_limit))
     emergency_target_rate = float(ppo_config.get("emergency_target_rate", args.emergency_target_rate))
     if emergency_target_rate < 0.0:
@@ -1232,7 +1390,7 @@ def _create_ppo_state(args, scenario_config):
         "actor_optimizer": actor_optimizer,
         "critic_optimizer": critic_optimizer,
         "lambda": lagrange_multiplier,
-        "lambda_lr": float(ppo_config.get("lambda_lr", args.ppo_lambda_lr)),
+        "lambda_lr": lambda_lr,
         "episode_costs": [],
         "hard_violation_spacing_m": float(
             ppo_config.get("hard_violation_spacing_m", args.ppo_hard_violation_spacing_m)
@@ -1646,6 +1804,22 @@ PPO_EPISODE_FIELDS = [
     "comm_failures",
     "comm_max_consecutive_failures",
     "comm_max_t_since_success_s",
+    "comm_tunnel_ticks",
+    "comm_tunnel_failures",
+    "p_tunnel",
+    "leader_target_speed_mps",
+    "leader_brake",
+    "leader_brake_time_sec",
+]
+
+# The PID follower logs the same tracking and safety columns, minus the learning ones.
+PID_EPISODE_FIELDS = [
+    name
+    for name in PPO_EPISODE_FIELDS
+    if name not in (
+        "updates_so_far", "lambda", "episode_reward", "mean_reward", "episode_cost", "mean_cost",
+        "episode_thw_cost", "mean_action",
+    )
 ]
 
 
@@ -1700,13 +1874,9 @@ def _record_ppo_update(ppo_state, result, episode_count):
     _append_csv_row(ppo_state["updates_csv"], PPO_UPDATE_FIELDS, row)
 
 
-def _record_ppo_episode(
-    ppo_state, episode_count, end_reason, elapsed_sec, rows, episode_stats, dt, comm_summary=None
-):
-    if not rows or episode_stats["ticks"] == 0:
-        return
+def _episode_tracking_row(episode_count, end_reason, elapsed_sec, rows, episode_stats, dt, comm_summary):
+    """Per-episode tracking and safety columns shared by the PID and PPO episode logs."""
     n = len(rows)
-    ticks = episode_stats["ticks"]
     thw_values = episode_stats["finite_thw"]
     accels = episode_stats["accels"]
     jerks = [abs(b - a) / dt for a, b in zip(accels, accels[1:])]
@@ -1714,17 +1884,12 @@ def _record_ppo_episode(
         "episode": episode_count,
         "end_reason": end_reason,
         "sim_time_sec": round(elapsed_sec, 3),
-        "updates_so_far": ppo_state["update_count"],
-        "lambda": round(ppo_state["lambda"], 5),
-        "episode_reward": round(episode_stats["reward_sum"], 5),
-        "mean_reward": round(episode_stats["reward_sum"] / ticks, 5),
-        "episode_cost": round(episode_stats["cost_sum"], 5),
-        "mean_cost": round(episode_stats["cost_sum"] / ticks, 5),
-        "episode_thw_cost": round(episode_stats["thw_cost_sum"], 5),
         "emergency_entered": int(episode_stats["emergency_entered"]),
         "emergency_ticks": episode_stats["emergency_ticks"],
         "collision": int("collision" in end_reason),
-        "mean_action": round(episode_stats["action_sum"] / ticks, 5),
+        "leader_target_speed_mps": episode_stats["leader_target_speed_mps"],
+        "leader_brake": episode_stats["leader_brake"],
+        "leader_brake_time_sec": episode_stats["leader_brake_time_sec"],
         "max_follower_speed_mps": max(r["follower_speed_mps"] for r in rows),
         "mean_follower_speed_mps": round(sum(r["follower_speed_mps"] for r in rows) / n, 5),
         "mean_abs_spacing_error_m": round(sum(abs(r["spacing_error_m"]) for r in rows) / n, 5),
@@ -1737,7 +1902,36 @@ def _record_ppo_episode(
         "min_distance_m": min(r["distance_m"] for r in rows),
     }
     row.update(comm_summary or {})
+    return row
+
+
+def _record_ppo_episode(
+    ppo_state, episode_count, end_reason, elapsed_sec, rows, episode_stats, dt, comm_summary=None
+):
+    if not rows or episode_stats["ticks"] == 0:
+        return
+    ticks = episode_stats["ticks"]
+    row = _episode_tracking_row(episode_count, end_reason, elapsed_sec, rows, episode_stats, dt, comm_summary)
+    row.update({
+        "updates_so_far": ppo_state["update_count"],
+        "lambda": round(ppo_state["lambda"], 5),
+        "episode_reward": round(episode_stats["reward_sum"], 5),
+        "mean_reward": round(episode_stats["reward_sum"] / ticks, 5),
+        "episode_cost": round(episode_stats["cost_sum"], 5),
+        "mean_cost": round(episode_stats["cost_sum"] / ticks, 5),
+        "episode_thw_cost": round(episode_stats["thw_cost_sum"], 5),
+        "mean_action": round(episode_stats["action_sum"] / ticks, 5),
+    })
     _append_csv_row(ppo_state["episodes_csv"], PPO_EPISODE_FIELDS, row)
+
+
+def _record_pid_episode(
+    episodes_csv, episode_count, end_reason, elapsed_sec, rows, episode_stats, dt, comm_summary=None
+):
+    if not rows:
+        return
+    row = _episode_tracking_row(episode_count, end_reason, elapsed_sec, rows, episode_stats, dt, comm_summary)
+    _append_csv_row(episodes_csv, PID_EPISODE_FIELDS, row)
 
 
 def _log_ppo_update(result):
@@ -1837,15 +2031,41 @@ def main(args):
                 ppo_state["gamma"],
                 ppo_state["rollout_steps"],
             )
-            # One channel per follower, keyed by receiver. An N-follower platoon (Algorithm 1
-            # line 21) extends this chain with ("follower_2", "follower"), ...
-            comm_channels = create_channels([("follower", "leader")], args.p_success, ppo_state["seed"])
-            logging.info(
-                "V2V comm: p_success=%.3f obs_dim=%d seed=%d (per-episode reseed)",
-                args.p_success,
-                ppo_state["obs_dim"],
-                ppo_state["seed"],
-            )
+            comm_seed = ppo_state["seed"]
+            comm_obs_dim = ppo_state["obs_dim"]
+            p_success = PPO_PAPER_P_SUCCESS if args.p_success is None else args.p_success
+        else:
+            # Same seed as a PPO run => same leader speed sequence and same packet draws.
+            comm_seed = int(args.seed)
+            random.seed(comm_seed)
+            comm_obs_dim = PPO_DEFAULT_OBS_DIM
+            p_success = 1.0 if args.p_success is None else args.p_success
+            pid_episodes_csv = Path(args.output_dir) / "pid" / "pid_episodes.csv"
+            pid_episodes_csv.parent.mkdir(parents=True, exist_ok=True)
+            pid_episodes_csv.unlink(missing_ok=True)
+
+        tunnel_zone = _tunnel_zone(scenario_config)
+        p_tunnel = _parse_p_tunnel(args.p_tunnel)
+        if p_tunnel is not None and tunnel_zone is None:
+            raise SystemExit("--p-tunnel needs communication.tunnel.entry/exit in the scenario file.")
+        # One channel per follower, keyed by receiver. An N-follower platoon (Algorithm 1
+        # line 21) extends this chain with ("follower_2", "follower"), ...
+        comm_channels = create_channels(
+            [("follower", "leader")], p_success, comm_seed, p_tunnel, args.tunnel_burst_ticks,
+            args.p_tunnel_noise_std, args.p_tunnel_noise_tau_sec,
+        )
+        logging.info(
+            "V2V comm: controller=%s p_success=%.3f p_tunnel=%s noise_std=%g tau=%gs burst_ticks=%g "
+            "obs_dim=%d seed=%d (per-episode reseed)",
+            args.controller,
+            p_success,
+            "off" if p_tunnel is None else "%.3f..%.3f" % p_tunnel,
+            args.p_tunnel_noise_std,
+            args.p_tunnel_noise_tau_sec,
+            args.tunnel_burst_ticks,
+            comm_obs_dim,
+            comm_seed,
+        )
 
         while True:
             vehicles = []
@@ -1895,6 +2115,13 @@ def main(args):
                     },
                 )
                 follower_route_tracker = _create_route_tracker(follower_agent.planned_route)
+                leader_route_tracker = _create_route_tracker(leader_agent.planned_route)
+                follower_tunnel_arc = _tunnel_arc_range(follower_route_tracker, tunnel_zone)
+                leader_tunnel_arc = _tunnel_arc_range(leader_route_tracker, tunnel_zone)
+                leader_brake_event = _create_leader_brake_event(
+                    scenario_config, args.leader_brake_prob, comm_seed, episode_count + 1, leader_tunnel_arc,
+                    {"low_speed_mps": args.leader_brake_low_speed, "brake": args.leader_brake_pedal},
+                )
                 leader_profile_state = _create_speed_profile_state(scenario_config, _get_speed_mps(leader_vehicle))
                 follower_pid_state = _create_follower_pid_state(scenario_config)
                 _update_spectator(world, [leader_vehicle, follower_vehicle], spectator_config)
@@ -1927,6 +2154,9 @@ def main(args):
                     "thw_cost_sum": 0.0,
                     "emergency_entered": False,
                     "emergency_ticks": 0,
+                    "leader_target_speed_mps": leader_profile_state["target_speed_mps"],
+                    "leader_brake": 0,
+                    "leader_brake_time_sec": "",
                 }
                 reward_state = {"prev_accel_mps2": None}
                 ppo_penalty = 0.0
@@ -1948,9 +2178,38 @@ def main(args):
                     tick_count += 1
                     timers["elapsed_sec"] = elapsed_sec
                     _update_speed_profile(leader_vehicle, leader_agent, leader_profile_state, dt)
+                    if leader_tunnel_arc is not None:
+                        _route_lateral_offset_m(leader_route_tracker, leader_vehicle.get_location())
+                    _update_leader_brake_event(
+                        leader_brake_event, leader_profile_state, leader_agent, leader_route_tracker["s"],
+                        _get_speed_mps(leader_vehicle), elapsed_sec, dt,
+                    )
+                    if leader_brake_event["active"] and not episode_stats["leader_brake"]:
+                        episode_stats["leader_brake"] = 1
+                        episode_stats["leader_brake_time_sec"] = leader_brake_event["start_time_sec"]
+                        logging.info(
+                            "Episode %d: leader hard brake at t=%.2fs, s=%.1f m",
+                            episode_count, elapsed_sec, leader_route_tracker["s"],
+                        )
                     leader_control = leader_agent.run_step()
                     leader_control = _apply_speed_profile_to_control(leader_control, leader_profile_state)
+                    leader_control = _apply_leader_brake_event(leader_control, leader_brake_event)
                     leader_vehicle.apply_control(leader_control)
+
+                    # Algorithm 1 lines 9-11: observe after the tick, push one packet through
+                    # the channel, then build S(t+1) from held sender state + own sensors. The
+                    # PID follower is driven by the same reading.
+                    lateral_offset_m = _route_lateral_offset_m(
+                        follower_route_tracker, follower_vehicle.get_location()
+                    )
+                    follower_in_tunnel = _in_tunnel(follower_route_tracker, follower_tunnel_arc)
+                    comm_in_tunnel = follower_in_tunnel
+                    if leader_tunnel_arc is not None:
+                        comm_in_tunnel = comm_in_tunnel or _in_tunnel(leader_route_tracker, leader_tunnel_arc)
+                    follower_comm = comm_channels["follower"]
+                    comm_reading = follower_comm.step(
+                        _v2v_sender_state(vehicles_by_id[follower_comm.sender_id]), dt, comm_in_tunnel
+                    )
 
                     follower_control, follower_metrics = _compute_follower_control(
                         leader_vehicle,
@@ -1958,30 +2217,27 @@ def main(args):
                         follower_agent,
                         follower_pid_state,
                         dt,
+                        leader_reading=comm_reading if args.controller == "pid" else None,
                     )
+                    follower_metrics.update(
+                        _ppo_comm_observation(
+                            follower_metrics,
+                            comm_reading,
+                            follower_vehicle,
+                            lateral_offset_m,
+                            comm_obs_dim,
+                        )
+                    )
+                    follower_metrics["follower_in_tunnel"] = int(follower_in_tunnel)
+                    follower_metrics["comm_in_tunnel"] = int(comm_in_tunnel)
+                    follower_metrics["comm_p"] = comm_reading["p_now"]
+                    follower_metrics["leader_brake_event"] = leader_brake_event["active"]
 
                     ppo_reward = None
                     ppo_cost = None
                     ppo_thw = None
 
                     if args.controller == "ppo":
-                        # Algorithm 1 lines 9-11: observe after the tick, push one packet through
-                        # the channel, then build S(t+1) from held sender state + own sensors.
-                        follower_comm = comm_channels["follower"]
-                        comm_reading = follower_comm.step(
-                            _v2v_sender_state(vehicles_by_id[follower_comm.sender_id]), dt
-                        )
-                        follower_metrics.update(
-                            _ppo_comm_observation(
-                                follower_metrics,
-                                comm_reading,
-                                follower_vehicle,
-                                _route_lateral_offset_m(
-                                    follower_route_tracker, follower_vehicle.get_location()
-                                ),
-                                ppo_state["obs_dim"],
-                            )
-                        )
                         # Current state is the outcome of the action chosen on the previous tick.
                         ppo_reward, ppo_cost, ppo_thw, ppo_penalty = _ppo_reward_and_cost(
                             follower_metrics,
@@ -2070,6 +2326,20 @@ def main(args):
                                 "inf" if math.isinf(ppo_thw) else f"{ppo_thw:.2f}",
                             )
 
+                    else:
+                        emergency_active = (
+                            follower_metrics["distance_m"] < follower_pid_state["emergency_distance_m"]
+                        )
+                        follower_metrics["emergency_brake"] = int(emergency_active)
+                        episode_stats["emergency_entered"] = episode_stats["emergency_entered"] or emergency_active
+                        episode_stats["emergency_ticks"] += int(emergency_active)
+                        episode_stats["ticks"] += 1
+                        episode_stats["accels"].append(follower_metrics["ego_accel_mps2"])
+                        if follower_metrics["ego_speed_mps"] > THW_MIN_SPEED_MPS:
+                            episode_stats["finite_thw"].append(
+                                follower_metrics["distance_m"] / follower_metrics["ego_speed_mps"]
+                            )
+
                     follower_vehicle.apply_control(follower_control)
                     rows.append({
                         "episode": episode_count,
@@ -2085,18 +2355,22 @@ def main(args):
                         "throttle": round(follower_metrics["throttle"], 3),
                         "brake": round(follower_metrics["brake"], 3),
                     })
-                    if args.controller == "ppo":
-                        rows[-1].update({
-                            "comm_success": follower_metrics["comm_success"],
-                            "comm_flag": follower_metrics["comm_flag"],
-                            "t_since_comm_s": round(follower_metrics["t_since_comm_s"], 3),
-                            "lead_accel_true_mps2": round(follower_metrics["lead_accel_mps2"], 4),
-                            "lead_accel_obs_mps2": round(follower_metrics["lead_accel_obs_mps2"], 4),
-                            "obs_spacing_error_m": round(follower_metrics["obs_spacing_error_m"], 3),
-                            "obs_relative_velocity_mps": round(follower_metrics["obs_relative_velocity_mps"], 3),
-                            "lateral_offset_m": round(follower_metrics["lateral_offset_m"], 3),
-                            "emergency_brake": follower_metrics["emergency_brake"],
-                        })
+                    rows[-1].update({
+                        "comm_success": follower_metrics["comm_success"],
+                        "comm_flag": follower_metrics["comm_flag"],
+                        "t_since_comm_s": round(follower_metrics["t_since_comm_s"], 3),
+                        "lead_accel_true_mps2": round(follower_metrics["lead_accel_mps2"], 4),
+                        "lead_accel_obs_mps2": round(follower_metrics["lead_accel_obs_mps2"], 4),
+                        "obs_spacing_error_m": round(follower_metrics["obs_spacing_error_m"], 3),
+                        "obs_relative_velocity_mps": round(follower_metrics["obs_relative_velocity_mps"], 3),
+                        "lateral_offset_m": round(follower_metrics["lateral_offset_m"], 3),
+                        "emergency_brake": follower_metrics["emergency_brake"],
+                        "follower_accel_mps2": round(follower_metrics["ego_accel_mps2"], 4),
+                        "follower_in_tunnel": follower_metrics["follower_in_tunnel"],
+                        "comm_in_tunnel": follower_metrics["comm_in_tunnel"],
+                        "comm_p": round(follower_metrics["comm_p"], 4),
+                        "leader_brake_event": follower_metrics["leader_brake_event"],
+                    })
                    
                     if tick_count % follower_pid_state["log_interval_ticks"] == 0:
                         _log_follower_metrics(episode_count, tick_count, follower_metrics)
@@ -2159,18 +2433,28 @@ def main(args):
                                 ppo_state["episode_costs"].append(
                                     episode_stats["cost_sum"] / episode_ticks
                                 )
-                            comm_summary = comm_channels["follower"].summary()
-                            logging.info(
-                                "Episode %d comm: failures=%d/%d max_consecutive=%d max_t_i=%.2fs",
-                                episode_count,
-                                comm_summary["comm_failures"],
-                                comm_summary["comm_ticks"],
-                                comm_summary["comm_max_consecutive_failures"],
-                                comm_summary["comm_max_t_since_success_s"],
-                            )
+                        comm_summary = comm_channels["follower"].summary()
+                        logging.info(
+                            "Episode %d comm: failures=%d/%d max_consecutive=%d max_t_i=%.2fs "
+                            "tunnel failures=%d/%d p_tunnel=%s",
+                            episode_count,
+                            comm_summary["comm_failures"],
+                            comm_summary["comm_ticks"],
+                            comm_summary["comm_max_consecutive_failures"],
+                            comm_summary["comm_max_t_since_success_s"],
+                            comm_summary["comm_tunnel_failures"],
+                            comm_summary["comm_tunnel_ticks"],
+                            comm_summary["p_tunnel"] if comm_summary["p_tunnel"] != "" else "off",
+                        )
+                        if args.controller == "ppo":
                             _record_ppo_episode(
                                 ppo_state, episode_count, reason, elapsed_sec, rows, episode_stats, dt,
                                 comm_summary,
+                            )
+                        else:
+                            _record_pid_episode(
+                                pid_episodes_csv, episode_count, reason, elapsed_sec, rows,
+                                episode_stats, dt, comm_summary,
                             )
                         _write_episode_csv(args.output_dir, episode_count, rows, controller=csv_name)
                         break
@@ -2312,11 +2596,70 @@ if __name__ == "__main__":
     argparser.add_argument(
         "--p-success",
         type=float,
-        default=PPO_PAPER_P_SUCCESS,
+        default=None,
         help=(
-            "Per-tick V2V packet success probability for the PPO follower (Algorithm 1 line 10). "
+            "Per-tick V2V packet success probability outside the tunnel (Algorithm 1 line 10). "
             f"Paper Table I: {PPO_PAPER_P_SUCCESS:g}. Use 1.0 for ideal communication "
-            f"(default: {PPO_PAPER_P_SUCCESS:g})"
+            f"(default: {PPO_PAPER_P_SUCCESS:g} for ppo, 1.0 for pid)"
+        ),
+    )
+    argparser.add_argument(
+        "--p-tunnel",
+        default=None,
+        help=(
+            "Packet success probability while either end of the V2V link is inside the tunnel "
+            "(communication.tunnel in the scenario file). P fixes it; LOW:HIGH draws one value per "
+            "episode, for training. Omit to disable the tunnel zone (default: off)"
+        ),
+    )
+    argparser.add_argument(
+        "--p-tunnel-noise-std",
+        type=float,
+        default=0.0,
+        help=(
+            "Std of Gaussian noise added to --p-tunnel over time: p(t) = clip(p_tunnel + n(t), 0, 1). "
+            "The same n(t) for every controller run with the same seed (default: 0, fixed p)"
+        ),
+    )
+    argparser.add_argument(
+        "--p-tunnel-noise-tau-sec",
+        type=float,
+        default=1.0,
+        help=(
+            "Correlation time of that noise [s]. 0 is white noise, which is statistically the same "
+            "as a fixed --p-tunnel (default: 1.0)"
+        ),
+    )
+    argparser.add_argument(
+        "--leader-brake-prob",
+        type=float,
+        default=0.0,
+        help=(
+            "Per-episode probability that the leader brakes hard inside the tunnel "
+            "(leader_brake_event in the scenario file sets where and how hard). The same episodes "
+            "get the event for every controller run with the same seed (default: 0, never)"
+        ),
+    )
+    argparser.add_argument(
+        "--leader-brake-low-speed",
+        type=float,
+        default=None,
+        help="Speed the leader brakes down to in the event [m/s]; 0 is a full stop "
+        f"(default: scenario file, else {LEADER_BRAKE_DEFAULTS['low_speed_mps']:g})",
+    )
+    argparser.add_argument(
+        "--leader-brake-pedal",
+        type=float,
+        default=None,
+        help=f"Brake pedal during the event, 0..1 (default: scenario file, else {LEADER_BRAKE_DEFAULTS['brake']:g})",
+    )
+    argparser.add_argument(
+        "--tunnel-burst-ticks",
+        type=float,
+        default=0.0,
+        help=(
+            "Mean length of an in-tunnel loss run in ticks (Gilbert model, average rate stays "
+            "--p-tunnel). 0 or 1 keeps independent losses (default: 0)"
         ),
     )
     argparser.add_argument(
@@ -2348,6 +2691,11 @@ if __name__ == "__main__":
         type=float,
         default=0.0,
         help="Initial Lagrange multiplier. The paper only requires lambda >= 0 (default: 0.0)",
+    )
+    argparser.add_argument(
+        "--no-lagrangian",
+        action="store_true",
+        help="Vanilla PPO baseline: keep lambda at 0 (no constraint term in the actor loss)",
     )
     argparser.add_argument(
         "--ppo-hard-violation-spacing-m",

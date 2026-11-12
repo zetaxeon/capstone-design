@@ -12,7 +12,7 @@
 
   "episode": {
     "mode": "infinite",
-    "max_time_sec": 45.0,
+    "max_time_sec": 60.0,
     "respawn_delay_sec": 0.25,
     "settle_time_sec": 1.5
   },
@@ -76,6 +76,14 @@
     "pitch": -18.0,
     "distance_scale": 0.8,
     "height_scale": 0.08
+  },
+
+  "communication": {
+    "_comment": "Tunnel portals in map x, y. Used only with --p-tunnel. Located from the tunnel lights and roof mesh of Town03_Opt (lights span x=201,y=-188 .. y=-64; roof mesh ends at y=-60).",
+    "tunnel": {
+      "entry": { "x": 200.0, "y": -194.0 },
+      "exit": { "x": 233.3, "y": -60.0 }
+    }
   },
 
   "leader": {

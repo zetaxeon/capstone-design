@@ -29,3 +29,14 @@ The `xeval*_run.sh` scripts need a running CARLA and delete/rewrite each cell fo
 | `xeval100_summarize.py` | Summarize the 100-episode cross-eval (outputs/xeval_100): entry rate with Wilson CI, paired emcost-comm09 differences, criterion 1. |
 | `xeval20_run.sh` | 20-episode cross-eval (run1026, comm09 x p 1.0/0.9/0.5). |
 | `xeval20_summarize.py` | Summarize the 20-episode cross-eval (outputs/xeval_20). Uses the old near-miss metric (min distance < 5.1 m); superseded by xeval100_summarize.py. *(near)* |
+
+## Tunnel communication experiment (2026-11-10)
+
+| Script | What it does |
+|---|---|
+| `tunnel_train.sh PORT "lag:42 ppo:42 ..."` | Fresh 3,000-episode training per job into `outputs/tunnel/train_<algo>_s<seed>/` (`lag` = PPO-Lag, `ppo` = `--no-lagrangian`). Defaults: p 0.9 outside, in-tunnel mean drawn per episode from 0.1–0.9, noise std 0.1 with 1 s correlation |
+| `tunnel_eval.sh [PORT]` | PID and every checkpoint under `outputs/tunnel/train_*`, 100 episodes each, over in-tunnel p 0.9 / 0.7 / 0.5 / 0.3 / 0.1, into `outputs/tunnel/eval/` |
+| `tunnel_summarize.py LABEL=RUN_DIR ...` | Per-zone table (pre / tunnel / recovery / final) for PID and PPO runs |
+| `tunnel_resume.sh` | Finishes the experiment from the 2026-11-12 state: retrains PPO seed 44 with a stall watchdog, evaluates the other cells meanwhile, then PPO seed 44. Starts its own two CARLA servers. See `docs/RESUME.md` |
+
+`tunnel_eval.sh` also takes `CKPTS="lag_s42 ppo_s42"` (only these checkpoints) and `RUN_PID=0` (skip the PID cells).
