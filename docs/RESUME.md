@@ -1,5 +1,9 @@
 # 터널 실험 재개 안내 (2026-11-12 16:19 중단 시점)
 
+> **2026-11-16 완료.** `analysis/tunnel_resume.sh`로 PPO seed 44 재학습(3000ep, 첫 시도 성공)과 평가 35칸을 모두 마쳤고,
+> p=1.0 기준 실행 4칸을 추가했다. 결과는 `docs/results/2026-11-16_tunnel_eval.md`. 아래 내용은 중단 당시 기록이다.
+> 세 파일 수정 금지 조건은 학습이 끝났으므로 해제됐다.
+
 터널 구간에서 V2V 통신 성공률이 떨어질 때 PPO-Lag, vanilla PPO, PID를 비교하는 실험이다.
 설계와 가정은 `docs/implementation_notes.md` 6절, 사전 점검 결과는 `docs/results/2026-11-10_tunnel_precheck.md`에 있다.
 
