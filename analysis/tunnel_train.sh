@@ -8,6 +8,8 @@
 # A run folder that already holds a finished train.log is skipped, so the script can be rerun.
 set -u
 REPO=$(cd "$(dirname "$0")/.." && pwd)
+PY=${PYTHON:-$REPO/.venv/bin/python}   # project venv (analysis/setup_venv.sh); PYTHON=... overrides
+[ -x "$PY" ] || { echo "no $PY: run analysis/setup_venv.sh first" >&2; exit 1; }
 PORT=${1:?port}
 JOBS=${2:?job list}
 EPISODES=${EPISODES:-3000}
@@ -29,7 +31,7 @@ for JOB in $JOBS; do
   { echo "git: $(git describe --always --dirty)"; echo "started: $(date '+%F %T')";
     git diff -- "*.py" "*.json" > "$OUT/code.diff"
     echo "algo=$ALGO seed=$SEED episodes=$EPISODES p_success=$P_OUT p_tunnel=$P_TUNNEL burst_ticks=$BURST noise_std=$NOISE_STD noise_tau=$NOISE_TAU leader_brake_prob=$BRAKE_PROB port=$PORT"; } > "$OUT/code_version.txt"
-  python3 episode_ppo_v2.py --controller ppo --ppo-fresh --no-rendering $EXTRA \
+  "$PY" episode_ppo_v2.py --controller ppo --ppo-fresh --no-rendering $EXTRA \
     --seed "$SEED" --train-episodes "$EPISODES" --p-success "$P_OUT" --p-tunnel "$P_TUNNEL" \
     --tunnel-burst-ticks "$BURST" --p-tunnel-noise-std "$NOISE_STD" --p-tunnel-noise-tau-sec "$NOISE_TAU" --leader-brake-prob "$BRAKE_PROB" --port "$PORT" --tm-port $((PORT + 6000)) \
     --ppo-checkpoint "$OUT/ppo_lag.pt" --output-dir "$OUT" --max-connect-wait-sec 300 \

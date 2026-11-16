@@ -5,6 +5,8 @@
 # Reads outputs/tunnel/train_*/ppo_lag.pt, writes outputs/tunnel/eval/<controller>_t<p>/.
 set -u
 REPO=$(cd "$(dirname "$0")/.." && pwd)
+PY=${PYTHON:-$REPO/.venv/bin/python}   # project venv (analysis/setup_venv.sh); PYTHON=... overrides
+[ -x "$PY" ] || { echo "no $PY: run analysis/setup_venv.sh first" >&2; exit 1; }
 PORT=${1:-2000}
 N=${N:-100}
 P_OUT=${P_OUT:-0.9}
@@ -22,14 +24,14 @@ COMMON="--no-rendering --train-episodes $N --seed $EVAL_SEED --p-success $P_OUT 
 for P in $SWEEP; do
   if [ "$RUN_PID" = 1 ]; then
     OUT=$E/pid_t$P; rm -rf "$OUT"
-    timeout 1800 python3 episode_ppo_v2.py --controller pid $COMMON --p-tunnel "$P" --output-dir "$OUT" > "$OUT.log" 2>&1
+    timeout 1800 "$PY" episode_ppo_v2.py --controller pid $COMMON --p-tunnel "$P" --output-dir "$OUT" > "$OUT.log" 2>&1
     echo "pid t=$P exit=$? episodes=$(grep -cE 'Episode [0-9]+ ended' "$OUT.log") $(date '+%T')"
   fi
   for CK in "$REPO"/outputs/tunnel/train_*/ppo_lag.pt; do
     NAME=$(basename "$(dirname "$CK")"); NAME=${NAME#train_}
     [ -n "$CKPTS" ] && ! echo " $CKPTS " | grep -q " $NAME " && continue
     OUT=$E/${NAME}_t$P; rm -rf "$OUT"
-    timeout 1800 python3 episode_ppo_v2.py --controller ppo --ppo-eval --ppo-checkpoint "$CK" $COMMON --p-tunnel "$P" --output-dir "$OUT" > "$OUT.log" 2>&1
+    timeout 1800 "$PY" episode_ppo_v2.py --controller ppo --ppo-eval --ppo-checkpoint "$CK" $COMMON --p-tunnel "$P" --output-dir "$OUT" > "$OUT.log" 2>&1
     echo "$NAME t=$P exit=$? episodes=$(grep -cE 'Episode [0-9]+ ended' "$OUT.log") $(date '+%T')"
   done
 done

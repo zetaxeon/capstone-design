@@ -3,6 +3,8 @@
 Analysis, evaluation, and aggregation scripts from 2026-11-03 (V2V comm model, emergency-brake entry cost, cross-evaluation).
 All paths are relative to the repository root, and every script can be run from any directory.
 
+Python environment: the run scripts (`tunnel_*.sh`, `xeval*_run.sh`) call `episode_ppo_v2.py` with the project venv, `.venv/bin/python` (git-ignored). Create it once with `analysis/setup_venv.sh`; it installs the versions pinned in `requirements-carla.txt` (numpy 1.26.4, torch 2.5.1+cu121, carla 0.9.16) and does not see the system or user site-packages, so installing other packages with the system `pip3` cannot change what the experiments run on. `PYTHON=/path/to/python` overrides the interpreter. Checked 2026-11-16: the first 5 episodes of `pid_t0.9` and `lag_s42_t0.9` rerun in the venv are byte-identical to the stored tick CSVs. Run the `.py` analysis scripts with the same interpreter (`.venv/bin/python analysis/<script>.py`): eight of them import pandas and `entry_counts.py` also scipy; the `tunnel_*.py` ones use only the standard library.
+
 Data the scripts read (local only; `outputs/` is in .gitignore):
 - `outputs/run1026_3000/`, `outputs/run_comm09_3000/`, `outputs/run_emcost_3000/`: training runs
 - `outputs/xeval_20/`: 20-episode cross-eval (run1026, comm09)

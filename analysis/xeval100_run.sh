@@ -4,6 +4,8 @@
 # Waits for the emcost training (pid given as $1) to exit; checkpoints are copied into outputs/xeval_100 first; the run folders are only read. Reruns delete and rewrite each cell folder.
 set -u
 REPO=$(cd "$(dirname "$0")/.." && pwd)
+PY=${PYTHON:-$REPO/.venv/bin/python}   # project venv (analysis/setup_venv.sh); PYTHON=... overrides
+[ -x "$PY" ] || { echo "no $PY: run analysis/setup_venv.sh first" >&2; exit 1; }
 X=$REPO/outputs/xeval_100
 mkdir -p $X
 N=100
@@ -23,7 +25,7 @@ for CK in run1026 comm09 emcost; do
   for P in 1.0 0.9 0.5; do
     OUT=$X/${CK}_p$P
     rm -rf $OUT
-    timeout 1800 python3 episode_ppo_v2.py --controller ppo --ppo-eval --no-rendering \
+    timeout 1800 "$PY" episode_ppo_v2.py --controller ppo --ppo-eval --no-rendering \
       --train-episodes $N --p-success $P --ppo-checkpoint $X/ckpt_$CK.pt \
       --output-dir $OUT --max-connect-wait-sec 180 > $OUT.log 2>&1
     echo "$CK p=$P exit=$? episodes=$(grep -cE 'Episode [0-9]+ ended' $OUT.log) $(date '+%T')"

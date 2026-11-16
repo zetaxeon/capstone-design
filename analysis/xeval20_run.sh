@@ -3,6 +3,8 @@
 # Checkpoints are copied into the output folder first; outputs/ is only read.
 set -u
 REPO=$(cd "$(dirname "$0")/.." && pwd)
+PY=${PYTHON:-$REPO/.venv/bin/python}   # project venv (analysis/setup_venv.sh); PYTHON=... overrides
+[ -x "$PY" ] || { echo "no $PY: run analysis/setup_venv.sh first" >&2; exit 1; }
 S=$REPO/outputs/xeval_20
 mkdir -p $S
 N=20
@@ -16,7 +18,7 @@ for CK in run1026 comm09; do
   for P in 1.0 0.9 0.5; do
     OUT=$S/${CK}_p$P
     rm -rf $OUT
-    timeout 1800 python3 episode_ppo_v2.py --controller ppo --ppo-eval --no-rendering \
+    timeout 1800 "$PY" episode_ppo_v2.py --controller ppo --ppo-eval --no-rendering \
       --train-episodes $N --p-success $P --ppo-checkpoint $S/ckpt_$CK.pt \
       --output-dir $OUT --max-connect-wait-sec 120 > $OUT.log 2>&1
     echo "$CK p=$P exit=$? episodes=$(grep -cE 'Episode [0-9]+ ended' $OUT.log) $(date '+%T')"
