@@ -1,5 +1,7 @@
 # Tunnel evaluation re-analysis with the paper's metrics (2026-11-17)
 
+> **주의.** PID 수치는 튜닝 전 게인(kd 0.1) 기준이다. 재튜닝 결과는 `2026-11-17_pid_retune.md`에 있다. 11-16 문서의 '4~8배'도 예전 PID 기준이고, 재튜닝 기준은 3.5~6배다.
+
 Offline re-analysis of the evaluation logs behind `2026-11-16_tunnel_eval.md`. Every number comes from the per-step CSVs in `outputs/tunnel/eval/` (42 cells, 100 episodes each). The analysis itself runs no simulation; the three vanilla-PPO cells at p = 1.0 were missing and were evaluated later the same day with the settings of the other p = 1.0 cells. Script: `analysis/tunnel_paper_metrics.py`; full tables in `outputs/tunnel/summary/paper_metrics.md`, one row per episode in `paper_metrics_episodes.csv`.
 
 ## 0. What the logs contain

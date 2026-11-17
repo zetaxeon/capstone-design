@@ -1,5 +1,7 @@
 # Tunnel V2V experiment: PPO-Lag vs vanilla PPO vs PID (2026-11-16)
 
+> **주의.** PID 수치는 튜닝 전 게인(kd 0.1) 기준이다. 재튜닝 결과는 `2026-11-17_pid_retune.md`에 있다. 11-16 문서의 '4~8배'도 예전 PID 기준이고, 재튜닝 기준은 3.5~6배다.
+
 Question: when V2V packet success drops inside the tunnel, how do PPO-Lag, vanilla PPO (λ fixed at 0) and PID compare? Design and assumptions: `docs/implementation_notes.md` Sec. 6.
 
 ## Setup
