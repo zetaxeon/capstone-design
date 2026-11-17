@@ -125,7 +125,7 @@ The ratios are dominated by the hard-brake episodes. Without a hard brake the le
 ## What changes against the two-vehicle results
 
 - F1 is unchanged; everything new is about F2 and about the platoon as a whole.
-- The ranking of the controllers is the same: on collisions the retuned PID is best at p ≤ 0.3 and the learned controllers lose safety only at p ≤ 0.3 and almost only in hard-brake episodes; on tracking the learned controllers are 3–5 times tighter than PID in both positions.
+- The ranking of the controllers is the same: on collisions the retuned PID is best at p ≤ 0.3 and the learned controllers lose safety only at p ≤ 0.3 and almost only in hard-brake episodes; on tracking the learned controllers are 3–6 times tighter than PID in both positions.
 - The platoon collision rate is higher than the two-vehicle rate only at p = 0.1 (+8 and +7 points for PPO-Lag and PPO).
 - New: the learned policies have a stage gain of about 1 behind another follower, while PID has 0.74–0.88.
 

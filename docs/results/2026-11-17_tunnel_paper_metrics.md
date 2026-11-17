@@ -71,7 +71,7 @@ THW cost is the mean sum per episode; Danger is the mean stay per episode in ste
 | 0.3 | 38 / 100 | 11 / 300 | 2 / 0 / 9 | 25 / 300 | 3 / 4 / 18 |
 | 0.1 | 72 / 100 | 131 / 300 | 39 / 26 / 66 | 175 / 300 | 44 / 59 / 72 |
 
-- PPO-Lag stays out of the Danger region down to p = 0.5 in all 900 episodes; PPO has one episode there at p = 0.5.
+- PPO-Lag stays out of the Danger region down to p = 0.5 in all 1200 episodes (p 1.0 / 0.9 / 0.7 / 0.5); PPO has one episode there at p = 0.5.
 - At p = 0.3 and 0.1 PPO-Lag's pooled THW cost and Danger stay are about 40–60% below PPO's (0.66 vs 1.76, 10.8 vs 18.8 per episode). Seed 44 is the worst seed of both algorithms and the per-seed ranges overlap, as with collisions (Sec. 3).
 - At p ≤ 0.3 all Danger steps of the learned controllers are inside the tunnel; at p = 0.1 about 80% are (PPO-Lag 7.23 of 8.91, PPO 11.40 of 14.85).
 - PID's Danger steps at p ≥ 0.5 come from the 20 m/s episodes and its tuning, not from communication (see the 11-16 document).
@@ -104,7 +104,7 @@ Three tests, each answering a different question:
 
 - **These six trained networks differ**: on the same 100 scenarios the three PPO-Lag networks collide less often than the three PPO networks at p = 0.3 and p = 0.1 (paired test p ≤ 0.001; PPO-Lag is better in 12 and 21 scenarios, PPO in 0 and 1).
 - **The algorithms are not shown to differ**: with the training seed as the unit, the difference is not significant (p = 0.60 and 0.40). With three seeds per algorithm the smallest p this test can give is 0.10, so three seeds could not have shown it at the 5% level whatever the outcome. The per-seed ranges overlap (23–49% vs 39–51% at p = 0.1) and one seed (44) carries most of the gap at p = 0.3.
-- **At p ≥ 0.5 there is no difference to test** (0 vs 1 collision in 900 episodes each).
+- **At p ≥ 0.5 there is no difference to test** (0 vs 1 collision in 1200 episodes each).
 - What can be claimed: "in this experiment PPO-Lag had fewer collisions at p ≤ 0.3, consistently across scenarios; whether this holds across training seeds is not established". Settling it at the seed level needs more training seeds per algorithm.
 
 ## 4. Collisions at p = 0.3 and 0.1 and the time since the last packet
