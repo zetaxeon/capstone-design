@@ -1,11 +1,11 @@
 # Implementation notes: paper vs. code
 
-Reference: the team's ITSC 2026 manuscript (`3월_논문.pdf`, Algorithm 1, eq. (8)–(15), Table I).
+Reference: the reference paper (Algorithm 1, eq. (8)–(15), Table I; not in this repository).
 Code: `episode_ppo_v2.py` (PPO-Lag follower) and `v2v_comm.py` (V2V channel).
 
-- **[PAPER]**: the value or definition comes from the manuscript.
-- **[ASSUMED]**: the manuscript does not specify it, so the code picked it. These items need to be either stated in the report or replaced with the paper's real setting.
-- **[DEVIATION]**: the manuscript does specify it, but the code deliberately does it differently.
+- **[PAPER]**: the value or definition comes from the reference paper.
+- **[ASSUMED]**: the reference paper does not specify it, so the code picked it. These items need to be either stated in the report or replaced with the paper's real setting.
+- **[DEVIATION]**: the reference paper does specify it, but the code deliberately does it differently.
 
 Last updated: 2026-11-03 (V2V communication model, 7-dim state, r_i changed to the planned-route reference; emergency-brake entry cost and override masking).
 

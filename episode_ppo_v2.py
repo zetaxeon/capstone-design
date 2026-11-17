@@ -976,7 +976,7 @@ def _print_spawn_points(world):
 
 
 # ---------------------------------------------------------------------------
-# PPO-Lagrangian longitudinal controller (baseline: team ITSC 2026 manuscript)
+# PPO-Lagrangian longitudinal controller (baseline: the reference paper)
 # Observation, paper eq. (8):
 #   obs_dim 7: [Δd^last, Δv^last, a_(i-1)^last, v_i, r_i, flag_i, t_i]
 #   obs_dim 4: [Δd^last, Δv^last, a_(i-1)^last, v_i]   (pre-comm layout; 10/26 checkpoint)

@@ -231,7 +231,7 @@ def main():
                      "3-vehicle only": int(((both.two == 0) & (both.three == 1)).sum())})
     print(md(pd.DataFrame(rows)), "\n")
 
-    print("## 6. the paper's six metrics per follower (layout of the manuscript's Fig. 5)")
+    print("## 6. the six evaluation metrics per follower")
     rows = []
     for p in ps:
         for label, g in groups(d[d.p == p]):

@@ -217,3 +217,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 outputs/
+
+# Papers and other PDFs are never committed (the repository is public)
+*.pdf

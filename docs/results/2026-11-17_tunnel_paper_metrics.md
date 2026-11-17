@@ -9,7 +9,7 @@ Offline re-analysis of the evaluation logs behind `2026-11-16_tunnel_eval.md`. E
 - Vanilla PPO at p = 1.0 was not part of the 11-16 evaluation; the three cells (`ppo_s4x_t1.0`) were added on 11-17.
 - Check of the method: the THW cost recomputed from the step files matches the value logged by the simulator in all 3600 learned-controller episodes (largest difference 0.002).
 
-The definitions below were checked against the manuscript afterwards: `2026-11-17_paper_crosscheck.md` (they match; the manuscript's plotted "average THW cost" is on the per-episode scale).
+The definitions below were checked against the reference paper afterwards and match: `2026-11-17_paper_crosscheck.md`.
 
 Definitions (same as `episode_ppo_v2.py`, true simulator state, every step of every episode including launch and final stop):
 
