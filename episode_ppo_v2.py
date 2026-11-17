@@ -230,6 +230,22 @@ def _align_scenario_to_map(stack_config, scenario_config, map_):
     }
     follower_stack_config.pop("spawn_point_index", None)
 
+    # Second follower (--followers 2): the same gap again, behind the first follower.
+    follower_2_stack_config = next(
+        (obj for obj in config.get("objects", []) if obj.get("id") == PLATOON_FOLLOWER_2_ID), None
+    )
+    if follower_2_stack_config is not None:
+        projected = _project_follower_spawn_from_leader(map_, projected_follower_spawn, follower_scenario_config)
+        follower_2_stack_config["spawn_point"] = {
+            "x": projected.location.x,
+            "y": projected.location.y,
+            "z": projected.location.z + 0.05,
+            "roll": projected.rotation.roll,
+            "pitch": projected.rotation.pitch,
+            "yaw": projected.rotation.yaw,
+        }
+        follower_2_stack_config.pop("spawn_point_index", None)
+
     leader_route_locations = _project_location_list(
         map_,
         _resolve_actor_route_locations(map_, _get_actor_scenario_config(scenario_config, "leader")),
@@ -241,7 +257,10 @@ def _align_scenario_to_map(stack_config, scenario_config, map_):
     else:
         follower_route_locations = _project_location_list(map_, follower_route_locations)
 
-    return config, {"leader": leader_route_locations, "follower": follower_route_locations}
+    routes = {"leader": leader_route_locations, "follower": follower_route_locations}
+    if follower_2_stack_config is not None:
+        routes[PLATOON_FOLLOWER_2_ID] = list(follower_route_locations)
+    return config, routes
 
 
 def _setup_world(client, map_name, tm_port, allow_map_load, map_load_requested):
@@ -344,10 +363,13 @@ def _restore_world(world, original_settings, traffic_manager):
 def _attach_collision_sensor(world, vehicle):
     bp = world.get_blueprint_library().find("sensor.other.collision")
     sensor = world.spawn_actor(bp, carla.Transform(), attach_to=vehicle)
-    state = {"collision": False}
+    state = {"collision": False, "other_ids": set()}
 
-    def _on_collision(_event):
+    def _on_collision(event):
         state["collision"] = True
+        other = getattr(event, "other_actor", None)
+        if other is not None:
+            state["other_ids"].add(other.id)
 
     sensor.listen(_on_collision)
     return sensor, state
@@ -1963,6 +1985,189 @@ def _log_ppo_update(result):
     )
 
 
+# ---------------------------------------------------------------------------
+# [ASSUMED] Three-vehicle platoon, evaluation only (--followers 2; paper Algorithm 1 line 21).
+# The second follower (F2) follows the first (F1) with the same controller: the same PPO
+# checkpoint deployed unchanged, or the same PID gains. F2 has its own V2V link from F1 with its
+# own packet stream (channel index 1), degraded while either end is in the tunnel. Everything F1
+# does is computed by the unchanged single-follower code; F2 is stepped after it each tick.
+# F2 logs go to <output-dir>/f2/ in the same format as F1's (the "leader_*" columns then describe
+# F2's predecessor, F1), and <output-dir>/platoon_episodes.csv records which pair collided.
+# ---------------------------------------------------------------------------
+PLATOON_FOLLOWER_2_ID = "follower_2"
+PLATOON_EPISODE_FIELDS = [
+    "episode", "end_reason", "sim_time_sec", "platoon_collision", "collision_f1_leader",
+    "collision_f2_f1", "collision_other", "f1_emergency_entered", "f2_emergency_entered",
+    "f1_min_distance_m", "f2_min_distance_m", "leader_target_speed_mps", "leader_brake",
+    "leader_brake_time_sec",
+]
+
+
+def _new_follower_episode_stats(leader_target_speed_mps):
+    return {
+        "reward_sum": 0.0, "cost_sum": 0.0, "action_sum": 0.0, "ticks": 0, "accels": [],
+        "finite_thw": [], "thw_cost_sum": 0.0, "emergency_entered": False, "emergency_ticks": 0,
+        "leader_target_speed_mps": leader_target_speed_mps, "leader_brake": 0,
+        "leader_brake_time_sec": "",
+    }
+
+
+def _step_second_follower(
+    f2, predecessor_vehicle, predecessor_in_tunnel, channel, args, ppo_state, comm_obs_dim, dt,
+    episode_count, elapsed_sec, tick_count, leader_phase, leader_brake_active,
+):
+    """One tick of F2: packet from F1, control, apply, log. Mirrors the F1 steps in main()."""
+    vehicle = f2["vehicle"]
+    pid_state = f2["pid_state"]
+    stats = f2["stats"]
+    lateral_offset_m = _route_lateral_offset_m(f2["route_tracker"], vehicle.get_location())
+    in_tunnel = _in_tunnel(f2["route_tracker"], f2["tunnel_arc"])
+    comm_in_tunnel = in_tunnel or predecessor_in_tunnel
+    reading = channel.step(_v2v_sender_state(predecessor_vehicle), dt, comm_in_tunnel)
+    control, metrics = _compute_follower_control(
+        predecessor_vehicle, vehicle, f2["agent"], pid_state, dt,
+        leader_reading=reading if args.controller == "pid" else None,
+    )
+    metrics.update(_ppo_comm_observation(metrics, reading, vehicle, lateral_offset_m, comm_obs_dim))
+    metrics["follower_in_tunnel"] = int(in_tunnel)
+    metrics["comm_in_tunnel"] = int(comm_in_tunnel)
+    metrics["comm_p"] = reading["p_now"]
+    metrics["leader_brake_event"] = leader_brake_active
+    emergency_active = metrics["distance_m"] < pid_state["emergency_distance_m"]
+
+    if args.controller == "ppo":
+        reward, cost, thw, _ = _ppo_reward_and_cost(metrics, f2["reward_state"])
+        thw_cost = cost
+        if emergency_active and not stats["emergency_entered"]:
+            stats["emergency_entered"] = True
+            cost += ppo_state["emergency_entry_cost"]
+        # Same action-repeat schedule as F1: a new decision on tick 1, then every action_repeat ticks.
+        if f2["pending_step"] is not None:
+            f2["window_ticks"] += 1
+        if f2["pending_step"] is None or f2["window_ticks"] >= ppo_state["action_repeat"]:
+            f2["pending_step"] = _ppo_policy_step(ppo_state, metrics["observation"], deterministic=True)
+            f2["window_ticks"] = 0
+        action = f2["pending_step"]["action"]
+        control = _ppo_longitudinal_control(action, control, metrics["distance_m"], pid_state["emergency_distance_m"])
+        metrics["throttle"] = control.throttle
+        metrics["brake"] = control.brake
+        stats["reward_sum"] += reward
+        stats["cost_sum"] += cost
+        stats["thw_cost_sum"] += thw_cost
+        stats["action_sum"] += action
+        if math.isfinite(thw):
+            stats["finite_thw"].append(thw)
+    else:
+        stats["emergency_entered"] = stats["emergency_entered"] or emergency_active
+        if metrics["ego_speed_mps"] > THW_MIN_SPEED_MPS:
+            stats["finite_thw"].append(metrics["distance_m"] / metrics["ego_speed_mps"])
+    metrics["emergency_brake"] = int(emergency_active)
+    stats["emergency_ticks"] += int(emergency_active)
+    stats["ticks"] += 1
+    stats["accels"].append(metrics["ego_accel_mps2"])
+
+    vehicle.apply_control(control)
+    f2["rows"].append({
+        "episode": episode_count,
+        "time_sec": round(elapsed_sec, 3),
+        "tick": tick_count,
+        "leader_phase": leader_phase,
+        "leader_speed_mps": round(metrics["lead_speed_mps"], 3),   # predecessor = F1
+        "follower_speed_mps": round(metrics["ego_speed_mps"], 3),
+        "distance_m": round(metrics["distance_m"], 3),
+        "desired_distance_m": round(metrics["desired_distance_m"], 3),
+        "spacing_error_m": round(metrics["spacing_error_m"], 3),
+        "relative_velocity_mps": round(metrics["relative_velocity_mps"], 3),
+        "throttle": round(metrics["throttle"], 3),
+        "brake": round(metrics["brake"], 3),
+        "comm_success": metrics["comm_success"],
+        "comm_flag": metrics["comm_flag"],
+        "t_since_comm_s": round(metrics["t_since_comm_s"], 3),
+        "lead_accel_true_mps2": round(metrics["lead_accel_mps2"], 4),
+        "lead_accel_obs_mps2": round(metrics["lead_accel_obs_mps2"], 4),
+        "obs_spacing_error_m": round(metrics["obs_spacing_error_m"], 3),
+        "obs_relative_velocity_mps": round(metrics["obs_relative_velocity_mps"], 3),
+        "lateral_offset_m": round(metrics["lateral_offset_m"], 3),
+        "emergency_brake": metrics["emergency_brake"],
+        "follower_accel_mps2": round(metrics["ego_accel_mps2"], 4),
+        "follower_in_tunnel": metrics["follower_in_tunnel"],
+        "comm_in_tunnel": metrics["comm_in_tunnel"],
+        "comm_p": round(metrics["comm_p"], 4),
+        "leader_brake_event": metrics["leader_brake_event"],
+    })
+    f2["metrics"] = metrics
+
+
+def _platoon_end_reason(reason, f2, collision_states, hard_violation_spacing_m):
+    """Adjust F1's episode ending for the second follower."""
+    if reason == "profile_completed" and f2["pid_state"]["stop_elapsed_sec"] < f2["pid_state"]["stop_hold_sec"]:
+        reason = None   # wait until F2 has stopped as well
+    if reason is None and collision_states[PLATOON_FOLLOWER_2_ID]["collision"]:
+        reason = "follower_2_collision"
+    if (
+        reason is None
+        and hard_violation_spacing_m is not None
+        and f2["metrics"]["spacing_error_m"] > hard_violation_spacing_m
+    ):
+        reason = "hard_violation_f2"
+    return reason
+
+
+def _record_platoon_episode(
+    output_dir, csv_name, args, ppo_state, episode_count, reason, elapsed_sec, dt, f2, f1_rows,
+    f1_stats, comm_summary, collision_states, vehicles_by_id,
+):
+    """F2's episode row and tick CSV under <output-dir>/f2/, plus the platoon collision record."""
+    f2_dir = Path(output_dir) / "f2"
+    stats = f2["stats"]
+    stats["leader_brake"] = f1_stats["leader_brake"]
+    stats["leader_brake_time_sec"] = f1_stats["leader_brake_time_sec"]
+    if f2["rows"]:
+        row = _episode_tracking_row(episode_count, reason, elapsed_sec, f2["rows"], stats, dt, comm_summary)
+        (f2_dir / csv_name).mkdir(parents=True, exist_ok=True)
+        if args.controller == "ppo":
+            ticks = max(1, stats["ticks"])
+            row.update({
+                "updates_so_far": ppo_state["update_count"],
+                "lambda": round(ppo_state["lambda"], 5),
+                "episode_reward": round(stats["reward_sum"], 5),
+                "mean_reward": round(stats["reward_sum"] / ticks, 5),
+                "episode_cost": round(stats["cost_sum"], 5),
+                "mean_cost": round(stats["cost_sum"] / ticks, 5),
+                "episode_thw_cost": round(stats["thw_cost_sum"], 5),
+                "mean_action": round(stats["action_sum"] / ticks, 5),
+            })
+            _append_csv_row(f2_dir / csv_name / "ppo_episodes.csv", PPO_EPISODE_FIELDS, row)
+        else:
+            _append_csv_row(f2_dir / csv_name / "pid_episodes.csv", PID_EPISODE_FIELDS, row)
+        _write_episode_csv(f2_dir, episode_count, f2["rows"], controller=csv_name)
+
+    ids = {name: vehicle.id for name, vehicle in vehicles_by_id.items()}
+
+    def hit(a, b):
+        return ids[b] in collision_states[a]["other_ids"] or ids[a] in collision_states[b]["other_ids"]
+
+    f1_leader = hit("leader", "follower")
+    f2_f1 = hit("follower", PLATOON_FOLLOWER_2_ID)
+    any_collision = any(state["collision"] for state in collision_states.values())
+    _append_csv_row(Path(output_dir) / "platoon_episodes.csv", PLATOON_EPISODE_FIELDS, {
+        "episode": episode_count,
+        "end_reason": reason,
+        "sim_time_sec": round(elapsed_sec, 3),
+        "platoon_collision": int(any_collision),
+        "collision_f1_leader": int(f1_leader),
+        "collision_f2_f1": int(f2_f1),
+        "collision_other": int(any_collision and not (f1_leader or f2_f1)),
+        "f1_emergency_entered": int(f1_stats["emergency_entered"]),
+        "f2_emergency_entered": int(stats["emergency_entered"]),
+        "f1_min_distance_m": min(r["distance_m"] for r in f1_rows) if f1_rows else "",
+        "f2_min_distance_m": min(r["distance_m"] for r in f2["rows"]) if f2["rows"] else "",
+        "leader_target_speed_mps": f1_stats["leader_target_speed_mps"],
+        "leader_brake": f1_stats["leader_brake"],
+        "leader_brake_time_sec": f1_stats["leader_brake_time_sec"],
+    })
+
+
 def main(args):
     scenario_path = Path(args.scenario).resolve()
     scenario_config = load_config_file(scenario_path)
@@ -1972,6 +2177,18 @@ def main(args):
         stack_path = scenario_path.parent / stack_path
     stack_config = load_config_file(stack_path)
     stack_config = _apply_scenario_to_stack(stack_config, scenario_config)
+    platoon = int(args.followers) == 2
+    if platoon:
+        if args.controller == "ppo" and not args.ppo_eval:
+            raise SystemExit("--followers 2 is evaluation only: use --ppo-eval or --controller pid.")
+        follower_2_object = copy.deepcopy(_find_object_config(stack_config, "follower"))
+        follower_2_object["id"] = PLATOON_FOLLOWER_2_ID
+        stack_config["objects"].append(follower_2_object)
+        for stale in (Path(args.output_dir) / "platoon_episodes.csv",
+                      Path(args.output_dir) / "f2" / "pid" / "pid_episodes.csv",
+                      Path(args.output_dir) / "f2" / "ppo_eval" / "ppo_episodes.csv"):
+            stale.parent.mkdir(parents=True, exist_ok=True)
+            stale.unlink(missing_ok=True)
 
     client = carla.Client(args.host, args.port)
     client.set_timeout(float(args.client_timeout))
@@ -2051,7 +2268,8 @@ def main(args):
         # One channel per follower, keyed by receiver. An N-follower platoon (Algorithm 1
         # line 21) extends this chain with ("follower_2", "follower"), ...
         comm_channels = create_channels(
-            [("follower", "leader")], p_success, comm_seed, p_tunnel, args.tunnel_burst_ticks,
+            [("follower", "leader")] + ([(PLATOON_FOLLOWER_2_ID, "follower")] if platoon else []),
+            p_success, comm_seed, p_tunnel, args.tunnel_burst_ticks,
             args.p_tunnel_noise_std, args.p_tunnel_noise_tau_sec,
         )
         logging.info(
@@ -2124,6 +2342,33 @@ def main(args):
                 )
                 leader_profile_state = _create_speed_profile_state(scenario_config, _get_speed_mps(leader_vehicle))
                 follower_pid_state = _create_follower_pid_state(scenario_config)
+                follower_2 = None
+                if platoon:
+                    follower_2_agent = _build_basic_agent(
+                        vehicles_by_id[PLATOON_FOLLOWER_2_ID],
+                        map_,
+                        scenario_config,
+                        route_locations_by_actor[PLATOON_FOLLOWER_2_ID],
+                        option_overrides={
+                            "ignore_traffic_lights": True,
+                            "ignore_stop_signs": True,
+                            "ignore_vehicles": True,
+                        },
+                    )
+                    follower_2_tracker = _create_route_tracker(follower_2_agent.planned_route)
+                    follower_2 = {
+                        "vehicle": vehicles_by_id[PLATOON_FOLLOWER_2_ID],
+                        "agent": follower_2_agent,
+                        "route_tracker": follower_2_tracker,
+                        "tunnel_arc": _tunnel_arc_range(follower_2_tracker, tunnel_zone),
+                        "pid_state": _create_follower_pid_state(scenario_config),
+                        "reward_state": {"prev_accel_mps2": None},
+                        "stats": _new_follower_episode_stats(leader_profile_state["target_speed_mps"]),
+                        "rows": [],
+                        "pending_step": None,
+                        "window_ticks": 0,
+                        "metrics": None,
+                    }
                 _update_spectator(world, [leader_vehicle, follower_vehicle], spectator_config)
 
                 episode_count += 1
@@ -2375,6 +2620,14 @@ def main(args):
                     if tick_count % follower_pid_state["log_interval_ticks"] == 0:
                         _log_follower_metrics(episode_count, tick_count, follower_metrics)
 
+                    if follower_2 is not None:
+                        _step_second_follower(
+                            follower_2, follower_vehicle, follower_in_tunnel,
+                            comm_channels[PLATOON_FOLLOWER_2_ID], args, ppo_state, comm_obs_dim, dt,
+                            episode_count, elapsed_sec, tick_count, leader_profile_state["phase"],
+                            leader_brake_event["active"],
+                        )
+
                     _update_spectator(world, [leader_vehicle, follower_vehicle], spectator_config)
 
                     reason = _evaluate_episode(
@@ -2389,6 +2642,11 @@ def main(args):
                         termination,
                         dt,
                     )
+                    if follower_2 is not None:
+                        reason = _platoon_end_reason(
+                            reason, follower_2, collision_states,
+                            ppo_state["hard_violation_spacing_m"] if args.controller == "ppo" else None,
+                        )
                     if (
                         reason is None
                         and args.controller == "ppo"
@@ -2457,6 +2715,13 @@ def main(args):
                                 episode_stats, dt, comm_summary,
                             )
                         _write_episode_csv(args.output_dir, episode_count, rows, controller=csv_name)
+                        if follower_2 is not None:
+                            _record_platoon_episode(
+                                args.output_dir, csv_name, args, ppo_state, episode_count, reason,
+                                elapsed_sec, dt, follower_2, rows, episode_stats,
+                                comm_channels[PLATOON_FOLLOWER_2_ID].summary(), collision_states,
+                                vehicles_by_id,
+                            )
                         break
             except Exception as exc:
                 logging.exception("Episode %d failed: %s", episode_count + 1, exc)
@@ -2559,6 +2824,14 @@ if __name__ == "__main__":
         choices=("pid", "ppo"),
         default="pid",
         help="Longitudinal controller to use: pid or ppo (default: pid)",
+    )
+    argparser.add_argument(
+        "--followers",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="Number of followers. 2 = three-vehicle platoon, evaluation only: the second follower "
+        "runs the same controller behind the first, logs under <output-dir>/f2/ (default: 1)",
     )
     argparser.add_argument(
         "--output-dir",

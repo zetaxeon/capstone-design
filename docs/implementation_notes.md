@@ -21,7 +21,7 @@ Last updated: 2026-11-03 (V2V communication model, 7-dim state, r_i changed to t
 | Δd, Δv on failure | Recomputed every tick from the held preceding-vehicle state and the **current** own-vehicle sensor values: Δd = ‖s_{i−1}^last − s_i(t)‖ − (d₀ + h·v_i(t)), Δv = v_{i−1}^last − v_i(t) | [ASSUMED] Option A. The ^last superscript in eq. (8) could also mean "freeze Δd and Δv themselves". We chose the reading that matches Sec. IV-A. |
 | Communication memory reset | At the start of each episode, initialize to the preceding vehicle's actual state; t_i = 0, flag_i = 0 | [PAPER] Algorithm 1 line 4; the initial values are [ASSUMED] |
 | Comm RNG | A `random.Random` per channel, reseeded with the string `(seed, channel index, episode number)` at the start of every episode | [ASSUMED]. Episodes within a run get different patterns; the same seed reproduces the same sequence. Separate from the policy-sampling RNG. |
-| Channel structure | One `V2VChannel` per receiving vehicle, managed as `{receiver: channel}`. Currently only `("follower", "leader")` | For a future N-vehicle setup (Algorithm 1 line 21), extend the chain |
+| Channel structure | One `V2VChannel` per receiving vehicle, managed as `{receiver: channel}`: `("follower", "leader")`, plus `("follower_2", "follower")` with `--followers 2` (Sec. 7) | Predecessor-following chain, as in the paper |
 | PID controller | `--controller pid` in `episode_ppo_v2.py` still uses true values (no comm model) | For PID with comm degradation, see `episode_comm.py`. To be decided in P3. |
 
 ### Ground truth vs. observed values
@@ -97,7 +97,7 @@ S_i = [Δd^last, Δv^last, a_{i−1}^last, v_i, r_i, flag_i, t_i]
 | T_s, h, d₀ | 0.05 s, 1.0 s, 7.0 m | [PAPER] |
 | Emergency brake | Brake = 1.0 when center-to-center distance < 5 m (overrides the policy). The first override tick of an episode is charged the entry cost K (Sec. 3), and fully overridden decision windows are masked out of the actor loss (Sec. 4) | [ASSUMED]: not in the paper. Roughly bumper contact. |
 | Lateral control | BasicAgent (CARLA) steering | Paper uses a centerline-based PID; equivalent role |
-| Policy deployment (line 21) | **Not implemented** | Planned for P4 |
+| Policy deployment (line 21) | Evaluation only, one extra follower: `--followers 2` (Sec. 7) | Added 2026-11-17 |
 | ROS2 | Training runs CARLA Python API directly, no ROS2 | **[DEVIATION]** from the paper's ROS2 co-simulation |
 
 ## 6. Tunnel communication zone and controller comparison (added 2026-11-10)
@@ -121,3 +121,27 @@ Nothing in this section is in the paper. It exists for the final experiment: V2V
 | Vanilla PPO baseline | `--no-lagrangian`: λ fixed at 0. Everything else identical to PPO-Lag | [ASSUMED] |
 | Zone metrics | `analysis/tunnel_summarize.py` cuts each episode into pre / tunnel / recovery (2 s after exit) / final (leader's stop) | [ASSUMED] |
 
+## 7. Three-vehicle platoon, evaluation only (added 2026-11-17)
+
+`--followers 2` adds a second follower (F2) behind the first (F1). It exists to evaluate the trained controllers in a platoon the way the paper deploys them (Algorithm 1 line 21); nothing here is used in training, and the flag is refused for a training run.
+
+| Item | Implementation | Source |
+|---|---|---|
+| Policy deployment | F2 runs the same controller as F1: the same PPO checkpoint, unchanged and deterministic, or the same PID gains. No retraining | [PAPER] line 21 for PPO; the policy was trained only behind the scripted leader, so F2's situation (a learned follower as predecessor) is outside its training distribution |
+| Platoon size | Leader + 2 followers | **[DEVIATION]**: the paper uses 3 followers |
+| Information flow | Predecessor-following: F2 receives only F1's state (location, speed, acceleration). The packet carries F1's own true state at send time, so stale leader data held by F1 is never forwarded | [PAPER] structure; packet content [ASSUMED] |
+| F1 → F2 link | A second `V2VChannel` (channel index 1) with its own packet stream and its own p(t) noise stream, same p_success and the same in-tunnel p as the leader → F1 link. Losses on the two links are independent | [ASSUMED] |
+| Tunnel test per link | A link uses the in-tunnel p while either of its two vehicles is inside the tunnel, so the F1 → F2 link enters and leaves the degraded state later than the leader → F1 link | [ASSUMED], same rule as Sec. 6 |
+| Leader → F1 stream | Unchanged (channel index 0, same seeds), and F1 is computed by the unchanged single-follower code path. With the same seed F1 therefore drives exactly as in the two-vehicle run until F2 touches it; verified tick for tick | Design choice, for comparability |
+| F2 state and observation | Same eq. (8) vector, with F1 as the preceding vehicle; r_i from F2's own planned route (the leader's route); same observation scales | [PAPER] / [ASSUMED] as for F1 |
+| Spacing, emergency brake | Same CTG target (h = 1.0 s, d0 = 7 m) and the same 5 m emergency brake, applied to the F1 – F2 gap | Same as F1 |
+| Spawn | F2 starts `follower.spawn_gap_m` (12 m) behind F1 on the same lane, found with the map's `previous()` waypoint | [ASSUMED] |
+| Action repeat | F2 takes a new decision on the same ticks as F1 (tick 1, then every 10 ticks) | [ASSUMED] |
+| Episode end | `profile_completed` needs both followers stopped for 1 s; any collision ends the episode at once (`leader_collision`: F1 into the leader; `follower_collision`: F1's sensor, in practice F2 into F1; `follower_2_collision`: F2's sensor only); `hard_violation_f2` when F2's spacing error exceeds the hard-violation limit (PPO runs only, the rule F1 already has) | [ASSUMED] |
+| Collision attribution | The collision sensors now record the other actor. `platoon_episodes.csv` has one row per episode: platoon collision (any pair), F1 – leader, F2 – F1, other | [ASSUMED] |
+| Censoring | Because the episode ends at the first collision, an F1 – leader collision removes F2's chance to collide. F2's collision rate is therefore reported over the episodes without an F1 – leader collision as well | Analysis convention |
+| Longer episodes | Episodes run until F2 has stopped, about 3–10 s longer than the two-vehicle ones. F1 keeps being logged over that tail, so F1's emergency-brake entries at the final stop are not comparable with the two-vehicle counts; its collisions are | Consequence of the ending rule |
+| Logs | F1: unchanged files. F2: the same files under `<output-dir>/f2/`; there the `leader_*` columns describe F2's predecessor, F1 | — |
+| Rear amplification | Per stage (F1 / leader, F2 / F1): ratio of RMS acceleration inside the tunnel, and ratio of peak deceleration in the 6 s after the leader's hard brake. Acceleration is the central difference of the logged speed over ±0.25 s, because the simulator's acceleration reading spikes for one tick when a vehicle comes to rest. Script: `analysis/platoon_metrics.py` | [ASSUMED] definition, not in the paper |
+
+Regression of the change (2026-11-17): with `--followers 1` the patched runner is byte-identical to the previous commit on the same server session (PPO-Lag seed 42, p = 0.3, 5 episodes, two runs each), and reproduces the stored two-vehicle results byte for byte for PID (p = 1.0 and 0.3, 5 episodes each), PPO-Lag seed 42 at p = 0.9 and PPO seed 43 at p = 0.1 (10 episodes each). One stored episode does not reproduce: `lag_s42_t0.3` episode 5 differs from 8.2 s on by 1e-4 in the simulator's acceleration reading under identical control inputs. The previous commit, the system Python, a fresh server and the second port all give today's result, so this is a one-off of the 11-16 simulator run, not a code difference.

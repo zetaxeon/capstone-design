@@ -3,6 +3,7 @@
 # packet draws), over a sweep of in-tunnel success probabilities.
 # Usage: analysis/tunnel_eval.sh [PORT]
 # Reads outputs/tunnel/train_*/ppo_lag.pt, writes outputs/tunnel/eval/<controller>_t<p>/.
+# FOLLOWERS=2 runs the three-vehicle platoon (second follower logs under <cell>/f2/); EVAL_DIR sets the output root.
 set -u
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 PY=${PYTHON:-$REPO/.venv/bin/python}   # project venv (analysis/setup_venv.sh); PYTHON=... overrides
@@ -18,9 +19,11 @@ BRAKE_PROB=${BRAKE_PROB:-0.5}
 EVAL_SEED=${EVAL_SEED:-1000}
 CKPTS=${CKPTS:-}      # optional: space-separated run names (e.g. "lag_s42 ppo_s42"); empty = every checkpoint
 RUN_PID=${RUN_PID:-1} # 0 skips the PID cells
-E=$REPO/outputs/tunnel/eval; mkdir -p "$E"
+FOLLOWERS=${FOLLOWERS:-1}
+E=${EVAL_DIR:-$REPO/outputs/tunnel/eval}; mkdir -p "$E"
 cd "$REPO"
 COMMON="--no-rendering --train-episodes $N --seed $EVAL_SEED --p-success $P_OUT --tunnel-burst-ticks $BURST --p-tunnel-noise-std $NOISE_STD --p-tunnel-noise-tau-sec $NOISE_TAU --leader-brake-prob $BRAKE_PROB --port $PORT --tm-port $((PORT + 6000)) --max-connect-wait-sec 300"
+[ "$FOLLOWERS" = 2 ] && COMMON="$COMMON --followers 2"
 for P in $SWEEP; do
   if [ "$RUN_PID" = 1 ]; then
     OUT=$E/pid_t$P; rm -rf "$OUT"
