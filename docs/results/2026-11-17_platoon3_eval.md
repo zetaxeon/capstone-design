@@ -136,3 +136,17 @@ The ratios are dominated by the hard-brake episodes. Without a hard brake the le
 - The amplification measures are this project's definition (not in the paper), computed over each follower's own time inside the tunnel.
 - F1's emergency-brake counts are not comparable with the two-vehicle evaluation (longer episodes).
 - PID gains were selected on evaluation seed 1000, the seed used here (confirmed on seed 2000 for two vehicles, not for the platoon).
+
+## Report figures (2026-11-17)
+
+Drawn from the existing results by `analysis/report_figures.py`; no new simulation. Two-vehicle points: PPO-Lag and PPO from the 11-16 evaluation (three seeds pooled, 300 episodes per point), PID from the retune (kp 0.4 / ki 0.01 / kd 0.6, 100 episodes per point). Labels are in Korean for the report.
+
+![In-tunnel spacing error against collision rate, two vehicles, one point per in-tunnel p](figures/2026-11-17_tradeoff_scatter.png)
+
+Trade-off: in-tunnel mean |spacing error| (log axis) against collision rate for every in-tunnel p from 1.0 to 0.1. The learned controllers stay at 0.5–0.9 m and pay with collisions at p ≤ 0.3; the retuned PID stays near 0% and pays with 2.5–16 m of error.
+
+![In-tunnel spacing error and collision rate against in-tunnel p](figures/2026-11-17_error_collision_by_p.png)
+
+Left: in-tunnel spacing error against p, two vehicles. Right: collision rate against p, solid for two vehicles and dashed for the three-vehicle platoon (any pair). The platoon was not evaluated at p = 0.7, so its dashed lines run from 0.9 to 0.5 directly.
+
+The per-seed spread is not drawn. At p = 0.1 the seeds range from 23 to 49% (PPO-Lag) and 39 to 51% (PPO) with two vehicles, so the gap between the PPO-Lag and PPO curves is within the seed range.
