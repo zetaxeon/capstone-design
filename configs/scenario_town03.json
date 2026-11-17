@@ -44,7 +44,7 @@
     "d0": 7.0,
     "kp": 0.4,
     "ki": 0.01,
-    "kd": 0.1,
+    "kd": 0.6,
     "integral_limit": 30.0,
     "emergency_distance_m": 5.0,
     "launch_speed_threshold_mps": 0.5,
