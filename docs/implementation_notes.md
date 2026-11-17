@@ -102,7 +102,7 @@ S_i = [Δd^last, Δv^last, a_{i−1}^last, v_i, r_i, flag_i, t_i]
 
 ## 6. Tunnel communication zone and controller comparison (added 2026-11-10)
 
-Nothing in this section is in the paper. It exists for the final experiment: V2V success drops while the platoon is in the tunnel, and PPO-Lag, vanilla PPO and PID are compared under the same losses.
+The tunnel zone and the hard-brake event are not in the paper; the comparison against PID and a standard PPO-based controller is (Sec. IV-A). This section exists for the final experiment: V2V success drops while the platoon is in the tunnel, and PPO-Lag, vanilla PPO and PID are compared under the same losses.
 
 | Item | Implementation | Source |
 |---|---|---|
@@ -118,7 +118,7 @@ Nothing in this section is in the paper. It exists for the final experiment: V2V
 | Shared losses | One uniform number u_t is drawn per tick from a stream seeded by (seed, channel, episode); the packet succeeds when u_t < p. Runs with the same `--seed` share u_t and the leader speed sequence, so controllers differ only on ticks where their zone differs | [ASSUMED] |
 | Leader hard brake in the tunnel | `--leader-brake-prob P`: with probability P per episode the leader, at a point drawn 30–60% of the way through the tunnel, applies full brake (measured about 7 m/s²) down to a full stop, holds 2 s, then accelerates back at the profile's 2 m/s². Whether and where is drawn from a stream seeded by (seed, episode), identical for every controller. `leader_brake_event` in the scenario file or `--leader-brake-low-speed`, `--leader-brake-pedal` change it. Braking only to 5 m/s was tried first and stressed no controller | [ASSUMED] |
 | Episode time limit | `episode.max_time_sec` raised 45 → 60 s, because a brake event at 15 m/s pushed episodes past 45 s. No earlier episode reached 45 s | [ASSUMED] |
-| Vanilla PPO baseline | `--no-lagrangian`: λ fixed at 0. Everything else identical to PPO-Lag | [ASSUMED] |
+| Vanilla PPO baseline | `--no-lagrangian`: λ fixed at 0. Everything else identical to PPO-Lag | Baseline itself [PAPER] ("standard PPO-based controller"); this construction [ASSUMED] |
 | Zone metrics | `analysis/tunnel_summarize.py` cuts each episode into pre / tunnel / recovery (2 s after exit) / final (leader's stop) | [ASSUMED] |
 
 ## 7. Three-vehicle platoon, evaluation only (added 2026-11-17)

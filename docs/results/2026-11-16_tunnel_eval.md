@@ -78,5 +78,5 @@ Conclusion: the PID collisions at p ≥ 0.5 are caused by the PID tuning against
 
 - Three seeds per algorithm, one evaluation seed (the same 100 scenarios for everything).
 - PID was not retuned; its result at 20 m/s is a tuning result, see above. Retuned on 2026-11-17 (kd 0.1 → 0.6): `2026-11-17_pid_retune.md`. The PID numbers in this document are the old gains.
-- The tunnel model, the hard-brake event and the vanilla PPO baseline are assumptions of this project, not from the paper.
+- The tunnel model and the hard-brake event are assumptions of this project, not from the paper. The paper does compare against a standard PPO-based controller; how ours is built (λ fixed at 0, otherwise identical to PPO-Lag) is this project's choice. (Corrected 2026-11-17; see `2026-11-17_paper_crosscheck.md`.)
 - The first evaluation cell (`lag_s42_t0.9`) failed twice at start-up with 0 episodes before succeeding on the third try; the cause was not captured (the retry overwrote the log). Its data is from the successful try.

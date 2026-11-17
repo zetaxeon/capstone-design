@@ -38,7 +38,7 @@ REPO = Path(__file__).resolve().parent.parent
 BRAKE_WINDOW_SEC = 6.0
 ACCEL_HALF_TICKS = 5      # central difference over +-0.25 s
 STEP_KEYS = ("ticks", "thw_cost_sum", "caution_ticks", "danger_ticks", "abs_err_tunnel", "abs_err_outside",
-             "thw_min_tunnel", "r_cont_sum", "r_jerk_sum")
+             "thw_min_tunnel", "r_cont_sum", "r_traf_sum", "r_jerk_sum")
 
 
 def speed_accel(v):
@@ -229,6 +229,27 @@ def main():
                      "same episodes": int((both.two == both.three).sum()),
                      "2-vehicle only": int(((both.two == 1) & (both.three == 0)).sum()),
                      "3-vehicle only": int(((both.two == 0) & (both.three == 1)).sum())})
+    print(md(pd.DataFrame(rows)), "\n")
+
+    print("## 6. the paper's six metrics per follower (layout of the manuscript's Fig. 5)")
+    rows = []
+    for p in ps:
+        for label, g in groups(d[d.p == p]):
+            for tag in ("f1", "f2"):
+                n = g[f"{tag}_ticks"].sum()
+                rows.append({
+                    "p": p, "controller": label, "follower": tag.upper(),
+                    "r_cont / step": round(g[f"{tag}_r_cont_sum"].sum() / n, 2),
+                    "r_traf / step": round(g[f"{tag}_r_traf_sum"].sum() / n, 2),
+                    "r_jerk / step": round(g[f"{tag}_r_jerk_sum"].sum() / n, 2),
+                    "THW cost / step": f"{g[f'{tag}_thw_cost_sum'].sum() / n:.5f}",
+                    "THW cost / episode": round(g[f"{tag}_thw_cost_sum"].mean(), 2),
+                    "Caution steps / episode": round(g[f"{tag}_caution_ticks"].mean(), 2),
+                    "Danger steps / episode": round(g[f"{tag}_danger_ticks"].mean(), 2),
+                    "steps / episode": round(g[f"{tag}_ticks"].mean()),
+                    "r_cont per seed": per_seed(g, lambda x: x[f"{tag}_r_cont_sum"].sum() / x[f"{tag}_ticks"].sum(), "{:.2f}"),
+                    "r_jerk per seed": per_seed(g, lambda x: x[f"{tag}_r_jerk_sum"].sum() / x[f"{tag}_ticks"].sum(), "{:.2f}"),
+                })
     print(md(pd.DataFrame(rows)), "\n")
 
     print("## 5. PPO-Lag vs PPO, platoon collisions")
