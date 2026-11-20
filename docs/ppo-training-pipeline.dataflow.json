@@ -2,241 +2,519 @@
   "schema_version": 1,
   "diagram_type": "dataflow",
   "meta": {
-    "title": "PPO-Lagrangian 추종 제어 학습 파이프라인",
-    "quality_profile": "standard",
-    "viewBox": [
-      1080,
-      700
-    ],
+    "title": "PPO-Lag 추종차 학습 데이터 파이프라인 (터널 V2V 실험)",
+    "output": "docs/ppo-training-pipeline.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/zetaxeon/capstone-design.git",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "cc585b560e6d70a6c1022b121d99f05a73136552"
+    },
     "legend": {
       "entries": {
+        "emphasis": {
+          "label": "주 데이터 경로"
+        },
         "security": {
-          "label": "safety / cost"
+          "label": "안전 비용 · λ 경로"
+        },
+        "dashed": {
+          "label": "가중치 갱신 · 저장"
+        },
+        "default": {
+          "label": "데이터 흐름"
+        },
+        "database": {
+          "label": "저장 파일"
         }
       }
-    }
+    },
+    "viewBox": [
+      1080,
+      696
+    ]
   },
   "stages": [
     {
-      "label": "환경"
+      "label": "환경 · 통신"
     },
     {
-      "label": "정책 · 가치"
+      "label": "관측 · 보상"
+    },
+    {
+      "label": "정책"
     },
     {
       "label": "롤아웃"
     },
     {
-      "label": "이득 · λ"
-    },
-    {
-      "label": "갱신"
+      "label": "갱신 · 제약"
     }
   ],
   "nodes": [
     {
-      "id": "carla",
-      "type": "external",
-      "label": "CARLA Env",
-      "sublabel": "Town03_Opt · dt 0.05s",
+      "id": "v2v",
+      "type": "messagebus",
+      "label": "V2V 채널",
+      "sublabel": "p 0.9 / 터널 U(0.1,0.9)",
+      "tag": "Last Value Hold",
       "stage": 0,
       "row": 1,
-      "tag": "sync tick",
-      "width": 150
+      "width": 150,
+      "sources": [
+        {
+          "path": "v2v_comm.py",
+          "line": 79,
+          "end_line": 168,
+          "label": "reset / step / LVH"
+        },
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 2444,
+          "end_line": 2457,
+          "label": "one packet per tick"
+        }
+      ]
     },
     {
-      "id": "actor",
-      "type": "backend",
-      "label": "Actor MLP",
-      "sublabel": "4-128-128-1 tanh",
-      "stage": 1,
-      "row": 0,
-      "tag": "own Adam + clip",
-      "width": 150
+      "id": "carla",
+      "type": "external",
+      "label": "CARLA Town03",
+      "sublabel": "동기 모드 dt 0.05 s",
+      "tag": "리더 급제동 p 0.5",
+      "stage": 0,
+      "row": 3,
+      "width": 150,
+      "sources": [
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 266,
+          "end_line": 292,
+          "label": "sync dt 0.05"
+        },
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 585,
+          "end_line": 643,
+          "label": "leader brake event"
+        },
+        {
+          "path": "analysis/tunnel_train.sh",
+          "line": 1,
+          "end_line": 40,
+          "label": "training run"
+        }
+      ]
     },
     {
-      "id": "critics",
+      "id": "obs",
       "type": "backend",
-      "label": "Critics (R + C)",
-      "sublabel": "separate MLPs",
+      "label": "관측 S(t) 7차원",
+      "sublabel": "Δd Δv a v r flag t",
+      "tag": "고정 스케일 정규화",
       "stage": 1,
       "row": 2,
-      "tag": "own Adam + clip",
-      "width": 150
+      "width": 150,
+      "sources": [
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 1191,
+          "end_line": 1211,
+          "label": "eq. (8) from V2V reading"
+        },
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 1067,
+          "end_line": 1071,
+          "label": "normalization"
+        }
+      ]
+    },
+    {
+      "id": "reward",
+      "type": "security",
+      "label": "보상 · 비용",
+      "sublabel": "식 (10)-(15) · THW 비용",
+      "tag": "긴급제동 진입 K 50",
+      "stage": 1,
+      "row": 4,
+      "width": 150,
+      "sources": [
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 1501,
+          "end_line": 1530,
+          "label": "reward and THW cost"
+        },
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 2485,
+          "end_line": 2506,
+          "label": "entry cost K"
+        }
+      ],
+      "yOffset": -30
+    },
+    {
+      "id": "policy",
+      "type": "backend",
+      "label": "Actor · Critic R/C",
+      "sublabel": "MLP 3개 · tanh 가우시안",
+      "tag": "5 m 이내 긴급제동 우선",
+      "stage": 2,
+      "row": 2,
+      "width": 150,
+      "sources": [
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 1261,
+          "end_line": 1286,
+          "label": "separate networks"
+        },
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 1447,
+          "end_line": 1489,
+          "label": "sample, throttle / brake"
+        },
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 1223,
+          "end_line": 1248,
+          "label": "return_stats"
+        }
+      ]
     },
     {
       "id": "buffer",
       "type": "messagebus",
-      "label": "Rollout Buffer",
-      "sublabel": "512 steps · repeat 10",
-      "stage": 2,
-      "row": 1,
-      "tag": "obs a logp r c V",
-      "width": 150
-    },
-    {
-      "id": "gae",
-      "type": "backend",
-      "label": "GAE",
-      "sublabel": "gamma 0.99^10 · 0.95",
-      "stage": 3,
-      "row": 1,
-      "tag": "A_r and A_c",
-      "width": 150
-    },
-    {
-      "id": "retstats",
-      "type": "database",
-      "label": "return_stats",
-      "sublabel": "running mean / std",
+      "label": "롤아웃 버퍼",
+      "sublabel": "결정 512개 · 10 tick 유지",
+      "tag": "구간 평균 r, c",
       "stage": 3,
       "row": 2,
-      "tag": "in checkpoint",
-      "width": 150
-    },
-    {
-      "id": "lamupd",
-      "type": "security",
-      "label": "Lagrange λ",
-      "sublabel": "max(0, λ + 0.01(J_c-5))",
-      "stage": 3,
-      "row": 3,
-      "tag": "per episode",
-      "width": 164
+      "width": 150,
+      "sources": [
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 2508,
+          "end_line": 2541,
+          "label": "action repeat window"
+        },
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 1545,
+          "end_line": 1563,
+          "label": "transition, actor mask"
+        },
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 2659,
+          "end_line": 2693,
+          "label": "terminal reward / cost"
+        }
+      ]
     },
     {
       "id": "update",
       "type": "backend",
-      "label": "PPO Update",
-      "sublabel": "clip 0.2 · 10 epochs",
+      "label": "GAE → PPO 갱신",
+      "sublabel": "clip 0.2 · 10 epoch",
+      "tag": "(A_r − λA_c)/(1+λ)",
+      "stage": 4,
+      "row": 2,
+      "width": 150,
+      "sources": [
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 1591,
+          "end_line": 1658,
+          "label": "two GAEs, normalization"
+        },
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 1670,
+          "end_line": 1726,
+          "label": "clipped surrogate, split Adam"
+        }
+      ]
+    },
+    {
+      "id": "lambda",
+      "type": "security",
+      "label": "라그랑주 승수 λ",
+      "sublabel": "λ ← [λ + η(E[C] − d)]+",
+      "tag": "tick 평균 비용 기준",
+      "stage": 4,
+      "row": 4,
+      "width": 150,
+      "sources": [
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 1728,
+          "end_line": 1739,
+          "label": "lambda step"
+        },
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 1040,
+          "end_line": 1064,
+          "label": "d, eta per tick"
+        }
+      ],
+      "yOffset": -30
+    },
+    {
+      "id": "ckpt",
+      "type": "database",
+      "label": "ppo_lag.pt",
+      "sublabel": "가중치 · λ · 옵티마이저",
+      "tag": "갱신마다 저장",
       "stage": 4,
       "row": 0,
-      "tag": "split optimizers",
-      "width": 150
+      "width": 150,
+      "sources": [
+        {
+          "path": "episode_ppo_v2.py",
+          "line": 1744,
+          "end_line": 1757,
+          "label": "torch.save"
+        }
+      ]
     }
   ],
   "flows": [
     {
-      "id": "obs-pi",
+      "id": "sender",
       "from": "carla",
-      "to": "actor",
-      "label": "obs to pi",
+      "to": "v2v",
+      "label": "위치 · 속도 · 가속도",
+      "route": "straight"
+    },
+    {
+      "id": "reading",
+      "from": "v2v",
+      "to": "obs",
+      "label": "수신값 · flag · t",
       "variant": "emphasis",
-      "labelDx": -42
+      "fromSide": "right",
+      "toSide": "left",
+      "via": [
+        [
+          207,
+          271
+        ],
+        [
+          207,
+          385
+        ]
+      ]
     },
     {
-      "id": "obs-v",
+      "id": "own",
       "from": "carla",
-      "to": "critics",
-      "label": "obs to V"
+      "to": "obs",
+      "label": "자차 v · 횡오차 r",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "bottom",
+      "via": [
+        [
+          315,
+          499
+        ]
+      ]
     },
     {
-      "id": "act",
-      "from": "actor",
+      "id": "truth",
+      "from": "carla",
+      "to": "reward",
+      "label": "실제 간격 · THW",
+      "variant": "security",
+      "fromSide": "left",
+      "toSide": "left",
+      "via": [
+        [
+          12,
+          499
+        ],
+        [
+          12,
+          583
+        ]
+      ],
+      "labelAt": [
+        126,
+        568
+      ]
+    },
+    {
+      "id": "obs-pol",
+      "from": "obs",
+      "to": "policy",
+      "label": "S(t)",
+      "variant": "emphasis",
+      "route": "straight"
+    },
+    {
+      "id": "control",
+      "from": "policy",
       "to": "carla",
       "label": "throttle / brake",
       "variant": "emphasis",
-      "labelDy": -70
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "via": [
+        [
+          530,
+          540
+        ],
+        [
+          100,
+          540
+        ]
+      ]
     },
     {
-      "id": "store-a",
-      "from": "actor",
+      "id": "pol-buf",
+      "from": "policy",
       "to": "buffer",
-      "label": "a, log pi",
-      "variant": "emphasis"
+      "label": "a · log π · V",
+      "variant": "emphasis",
+      "route": "straight",
+      "labelAt": [
+        638,
+        345
+      ]
     },
     {
-      "id": "store-v",
-      "from": "critics",
+      "id": "rc",
+      "from": "reward",
       "to": "buffer",
-      "label": "V_r, V_c"
+      "label": "구간 평균 r · c",
+      "variant": "security",
+      "fromSide": "right",
+      "toSide": "bottom",
+      "via": [
+        [
+          745,
+          583
+        ]
+      ]
     },
     {
       "id": "batch",
       "from": "buffer",
-      "to": "gae",
-      "label": "512 steps",
-      "variant": "emphasis"
-    },
-    {
-      "id": "ep-cost",
-      "from": "carla",
-      "to": "lamupd",
-      "label": "episode cost",
-      "variant": "security",
-      "route": "bottom-channel"
-    },
-    {
-      "id": "stats",
-      "from": "gae",
-      "to": "retstats",
-      "label": "return stats",
-      "labelDy": 24
-    },
-    {
-      "id": "adv",
-      "from": "gae",
       "to": "update",
-      "label": "A_r, A_c",
+      "label": "512 결정",
       "variant": "emphasis",
-      "labelDx": -42
+      "route": "straight"
     },
     {
-      "id": "scale",
-      "from": "retstats",
-      "to": "update",
-      "label": "mu, sigma"
+      "id": "epcost",
+      "from": "reward",
+      "to": "lambda",
+      "label": "에피소드 tick 평균 비용",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "via": [
+        [
+          315,
+          640
+        ],
+        [
+          960,
+          640
+        ]
+      ],
+      "labelAt": [
+        637,
+        626
+      ]
     },
     {
       "id": "lam",
-      "from": "lamupd",
+      "from": "lambda",
       "to": "update",
-      "label": "lambda",
-      "variant": "dashed"
+      "label": "λ",
+      "variant": "security",
+      "route": "straight"
     },
     {
-      "id": "upd-actor",
+      "id": "weights",
       "from": "update",
-      "to": "actor",
-      "label": "theta update",
+      "to": "policy",
+      "label": "θ · φ 갱신",
       "variant": "dashed",
-      "route": "top-channel"
+      "fromSide": "top",
+      "toSide": "top",
+      "via": [
+        [
+          960,
+          320
+        ],
+        [
+          530,
+          320
+        ]
+      ]
     },
     {
-      "id": "upd-critics",
+      "id": "save",
       "from": "update",
-      "to": "critics",
-      "label": "phi update",
+      "to": "ckpt",
+      "label": "저장",
       "variant": "dashed",
-      "labelDy": 30
+      "fromSide": "right",
+      "toSide": "right",
+      "via": [
+        [
+          1055,
+          385
+        ],
+        [
+          1055,
+          157
+        ]
+      ]
     }
   ],
   "cards": [
     {
       "dot": "emerald",
-      "title": "주 경로",
+      "title": "주 경로 (학습 중 매 tick)",
       "items": [
-        "CARLA tick → 관측 → Actor 행동 → 다시 CARLA에 적용되는 제어 루프입니다",
-        "행동 하나를 10 tick(0.5 s) 유지하고, 그 구간의 보상·비용 평균을 전이 하나로 기록합니다",
-        "버퍼에 512개 결정이 쌓이면 에피소드 도중이라도 업데이트가 실행됩니다"
+        "CARLA tick → V2V 패킷 1개 → 관측 7차원 → Actor 행동 → throttle/brake 적용",
+        "행동 하나를 10 tick(0.5 s) 유지하고, 그 구간의 r, c 평균을 전이 하나로 버퍼에 넣습니다",
+        "결정 512개가 쌓이면 에피소드 도중이라도 GAE와 PPO 갱신이 돌고 체크포인트를 저장합니다"
       ]
     },
     {
       "dot": "cyan",
-      "title": "이번에 고친 두 가지",
+      "title": "통신 열화가 들어가는 곳",
       "items": [
-        "Actor와 두 Critic이 완전히 분리된 MLP이고, 옵티마이저와 grad clip도 각각 따로입니다",
-        "예전에는 backbone 하나에 clip 0.5를 한 번만 걸어 크리틱 그래디언트가 액터를 굶겼습니다",
-        "Reward Critic은 return_stats로 정규화된 단위에서 학습하고, 값은 GAE 전에 역정규화됩니다"
+        "앞차 정보는 V2V 채널을 거친 값만 관측에 들어갑니다. 손실 tick에는 마지막 수신값을 유지합니다",
+        "관측의 flag(이번 tick 손실 여부)와 t(마지막 수신 후 경과 s)로 정책이 통신 상태를 봅니다",
+        "학습 때 터널 p는 에피소드마다 U(0.1, 0.9)에서 뽑고, std 0.1 · τ 1 s 노이즈를 더합니다"
       ]
     },
     {
-      "dot": "amber",
-      "title": "안전 제약 경로",
+      "dot": "rose",
+      "title": "안전 비용과 λ",
       "items": [
-        "THW가 1.2 s 아래로 내려가면 비용이 붙고, 1.0 s 이하는 비용 1입니다",
-        "λ는 에피소드 누적 비용의 평균이 한계 d = 5를 넘을 때만 올라갑니다",
-        "이득을 (1 + λ)로 나눠 λ가 커져도 액터 보폭이 발산하지 않게 잡아 둡니다"
+        "비용은 실제 간격으로 계산한 THW 기준: 1.2 s 이상 0, 1.0 s 이하 1, 사이는 제곱 보간",
+        "5 m 긴급제동에 처음 들어간 tick에 K = 50을 한 번 더하고, 전부 개입된 구간은 Actor 손실에서 뺍니다",
+        "λ는 갱신마다 에피소드 tick 평균 비용과 d = 5/650을 비교해 올리거나 내립니다. vanilla PPO는 λ = 0 고정"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "평가 모드 (--ppo-eval)",
+      "items": [
+        "Actor 평균 행동(결정적)만 쓰고 버퍼, GAE, 갱신, 체크포인트 저장은 돌지 않습니다",
+        "같은 평가 seed면 리더 속도, 급제동, 패킷 난수가 제어기와 무관하게 같습니다"
       ]
     }
   ]
